@@ -233,7 +233,7 @@ Router 的逻辑身份与某个会话窗口分别记录。更换绑定后通知�
 
 对应上游：Modules。
 
-下表是当前代码索引，不是要求继续保留每个旧规则。插件面板尚未实现，不给它编造已有文件名。
+下表列出服务模块；新增面板在 `plugin/osa/src/panel.tsx`，插件 worker 通过 Unix socket 调用服务，窗口适配在 `src/windows.ts`。
 
 | 当前文件 | 责任与适配重点 |
 | --- | --- |
@@ -246,7 +246,7 @@ Router 的逻辑身份与某个会话窗口分别记录。更换绑定后通知�
 | `src/orca-session.ts` | 已有会话通信及操作结果核对 |
 | `src/github.ts` | GitHub 接收、PR 关联和发件箱发送 |
 | `src/feishu.ts` | 飞书身份、话题读取和回复 |
-| `src/review.ts`、`src/publish.ts` | 旧审查与发布逻辑；按已确认的原版交付规则重新核对 |
+| `src/publish.ts` | 逐仓发布、目标授权及当前提交交付证明；旧 review.ts 通用门禁已删除 |
 | `src/cleanup.ts` | 既有工作区检查与清理；不等于任务结束必须删除目录 |
 | `src/watchdog.ts` | 已有原生异常事件导入，不代替业务授权或执行结果 |
 | `bin/osa.ts` | CLI、本机服务接口、运行组装与循环 |
@@ -267,7 +267,7 @@ Router 的逻辑身份与某个会话窗口分别记录。更换绑定后通知�
 | `tests/app.test.ts`、`tests/store.test.ts`、`tests/projects.test.ts` | 应用操作、持久记录和项目关系 |
 | `tests/orca.test.ts`、`tests/orca-session.test.ts`、`tests/router.test.ts` | 原生执行与会话适配、Router 唤醒 |
 | `tests/github.test.ts`、`tests/feishu.test.ts` | 来源接收和回复 |
-| `tests/report.test.ts`、`tests/review.test.ts`、`tests/publish.test.ts` | 报告及旧版审查、发布规则 |
+| `tests/report.test.ts`、`tests/publish.test.ts` | 报告、逐仓发布及当前提交交付证明 |
 | `tests/cleanup.test.ts`、`tests/watchdog.test.ts` | 资源处理与异常事件 |
 | `tests/cli.test.ts`、`tests/service.test.ts`、`tests/supervisor.test.js` | 命令、启停和托管 |
 

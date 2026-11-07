@@ -33,14 +33,15 @@ export class WorkspaceCleanup {
     const owned = operation?.response?.result?.worktree
     if (!directory || !owned?.id || owned.path !== directory || directory === target.repository) reasons.push('Not a ticket-owned isolated worktree')
     if (!ticket.ended) reasons.push('Business ticket is still open')
-    const shared = this.store.tickets.list().filter(t => t.id === ticketId || directory && projects.directory(t.id) === directory)
+    const shared = this.store.tickets.list().filter(t => t.id === ticketId || directory && (projects.directory(t.id) === directory || projects.workspaces(t.id).some(workspace => workspace.directory === directory)))
     const bindings = this.store.list<any>('orca-assignment').filter(b => shared.some(t => t.id === b.ticketId))
     if (!bindings.length || bindings.some(b => !b.finished)) reasons.push('Executor resources are unresolved')
     if (bindings.some(b => (b.releaseState ?? this.store.get<any>('orca-operation', `release:${b.id}:${b.dispatchId}`)?.response?.result?.state) === 'retained')) reasons.push('A terminal was explicitly retained or user-owned')
     if (shared.some(t => { const plan = this.store.get<{goalId?: string}>('task-plan', t.id); return plan?.goalId && !this.store.get<{archived?: boolean}>('goal', plan.goalId)?.archived })) reasons.push('Persistent workline retains this directory until explicitly archived')
     if (directory && this.store.list<any>('knowledge').some(k => !k.archived && !k.supersededBy && JSON.stringify(k).includes(directory))) reasons.push('Engineering knowledge references this directory; inspect runtime dependencies')
     if (directory && this.store.tickets.list().some(other => other.id !== ticketId && !other.ended && (projects.directory(other.id) === directory
-      || (projects.context(other.id) as {dependencies: {directory?: string}[]}).dependencies.some(d => d.directory === directory)))) reasons.push('Another ticket references this workspace or its evidence')
+      || projects.workspaces(other.id).some(workspace => workspace.directory === directory)
+      || (projects.context(other.id) as {dependencies: {directory?: string; workspaces: {directory: string}[]}[]}).dependencies.some(d => d.directory === directory || d.workspaces.some(workspace => workspace.directory === directory))))) reasons.push('Another ticket references this workspace or its evidence')
     if (directory && this.store.list<any>('handoff').some(h => JSON.stringify(h).includes(directory))) reasons.push('Handoff evidence references this directory; preserve it outside the workspace first')
     if (directory && this.store.list<Cleanup>('workspace-cleanup').some(c => c.directory === directory && c.state !== 'reset')) reasons.push('Saved cleanup attempt requires reconciliation or an explicit reset')
     let head: string | undefined, branch: string | undefined, status: string | undefined, terminals: unknown

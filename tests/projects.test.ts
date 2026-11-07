@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -62,7 +62,7 @@ it('validates goal scope and dependency cycles atomically and requires actual su
   f.store.put('orca-assignment', 'aa', { dispatchId: 'd', settled: 'm' }); f.store.put('execution', 'aa', { dispatchId: 'd', outcome: 'succeeded' })
   expect(f.projects.blocked('b1')).toBeUndefined()
   f.store.put('config', 'two-layer', true)
-  expect(f.projects.blocked('b1')).toContain('review')
+  expect(f.projects.blocked('b1')).toBeUndefined()
   f.store.put('review', 'aa', { verdict: 'approve', executorDispatchId: 'd' })
   expect(f.projects.blocked('b1')).toBeUndefined()
   f.store.put('execution', 'aa', { dispatchId: 'old', outcome: 'succeeded' })
@@ -168,6 +168,8 @@ it('continues a workline on its exact location, keeps separate identities and re
   expect(f.projects.blocked(next.id)).toBeUndefined()
   const parallel = prepare('parallel',{workspace:'isolated'})
   expect(f.projects.directory(parallel.id)).toBeUndefined()
+  const publishing = prepare('publishing', {publish:'true'})
+  expect(f.store.get<any>('task-plan', publishing.id).continueFrom).toBeUndefined()
   expect(() => f.projects.handle(['goal','close'],{id:'g'})).toThrow('open work')
 })
 
@@ -213,4 +215,27 @@ it('explicit legacy adoption preserves execution and cannot move an already scop
   expect(f.store.get<any>('orca-assignment','active').dispatchId).toBe('keep')
   f.projects.handle(['goal','add'],{id:'other',name:'Other',projects:'a'})
   expect(() => f.projects.handle(['goal','adopt'],{id:'other',ticket:t.id})).toThrow()
+})
+
+it('binds several repositories to one immutable business task and scopes all workspace context', () => {
+  const f = fixture(); f.add('a'); f.add('b')
+  const second = realpathSync(mkdtempSync(join(tmpdir(), 'osa-project-repo-')))
+  clean.push(() => rmSync(second, { recursive: true, force: true }))
+  execFileSync('git', ['init', '-q', second])
+  f.projects.handle(['component', 'add'], { id: 'api', name: 'API', project: 'a' })
+  f.projects.handle(['location', 'add'], { id: 'api', name: 'API', component: 'api', repository: second })
+  expect(f.projects.resolve({project: 'a', location: 'api'}).repository).toBe(second)
+  const ticket = {...f.ticket('old', 'b'), id: 'multi'}
+  f.projects.bind(ticket, {project: 'a', locations: 'a,api'}); f.store.tickets.save(ticket)
+  expect(f.projects.targets(ticket.id).map(target => target.locationId)).toEqual(['a', 'api'])
+  expect(() => f.projects.bind(ticket, {project: 'a', locations: 'api'})).toThrow('immutable')
+  expect(() => f.projects.resolve({project: 'a', locations: 'a,b'})).toThrow('chosen project')
+  f.store.put('ticket-workspace', `${ticket.id}:api`, {ticketId: ticket.id, locationId: 'api', repository: second, directory: second + '/work', name: 'multi'})
+  expect(f.projects.directory(ticket.id, 'api')).toBe(second + '/work')
+  const fact = {name:'API environment',source:'checked',version:'1',text:'API uses its own test command'}
+  f.projects.memo(ticket.id, 'executor', 'add', {...fact,location:'api'})
+  expect(JSON.stringify(f.projects.context(ticket.id))).toContain('API uses its own test command')
+  expect(JSON.stringify(f.projects.context('old'))).not.toContain('API uses its own test command')
+  f.projects.handle(['location', 'archive'], {id:'api'})
+  expect(f.projects.blocked(ticket.id)).toContain('archived')
 })

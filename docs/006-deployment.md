@@ -2,7 +2,7 @@
 
 本章承接 [005 面板](005-panel.md)，按上游 [006 Deployment](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/docs/006-deployment.md) 的全部小节顺序，说明界面接入、运行环境、账号、启停与升级。
 
-状态：2026-11-06，讨论稿。**首选方案是一个 Orca 插件入口，连接一套本机 OSA 服务和状态库，管理多个项目。** 本轮只核对文档、公开 CLI 能力和现有源码，未制作、安装或启用插件，未重启服务。
+状态：2026-11-07 开发版。**一个 Orca 插件入口连接一套本机 OSA 服务和状态库，管理多个项目。** 插件与服务接口已实现；正式服务是否升级、插件是否加载和实际验收结果以本轮验证记录为准。
 
 原版部署依赖 DeepSeek Harness；OSA 使用 Orca，因此保留部署原则与工作语义，替换宿主相关步骤。旧 OSA 脚本可以复用，但不因已经存在就视为符合新版要求。
 
@@ -93,7 +93,7 @@ rtk npm run typecheck
 rtk npm test
 ```
 
-这些命令安装依赖并检查代码，不等于安装完整 OSA 产品。新插件尚未制作，因此本章不提供虚构的一键安装命令。
+这些命令安装依赖并检查代码。插件在 `plugin/osa`，使用 `orca plugin validate/check/test plugin/osa --json` 检查，使用 `plugin dev load` 加载；首次代码权限须由所有者批准。具体命令见根目录 README。
 
 插件实现后，使用 Orca 原生的 manifest 校验、插件检查和安装方式。校验通过后再加载具体插件；需要的访问批准由 Orca 对该插件及其实际能力提出。开发加载与正式发行分别标明，开发目录不作为长期生产部署的隐含前提。
 
@@ -128,10 +128,10 @@ rtk npm test
 
 ```sh
 rtk proxy node scripts/osa-service.mjs status --state /absolute/osa-state
-rtk proxy node --experimental-transform-types bin/osa.ts --state /absolute/osa-state status --lease ROUTER_LEASE
+rtk proxy node --experimental-transform-types bin/osa.ts --state /absolute/osa-state owner status
 ```
 
-第一条查询服务进程，第二条读取任务等业务记录；`ROUTER_LEASE` 替换为当前有效的 Router 租约。旧接口要求该租约，不要为一次查询反复接管 Router。插件面板的只读入口需要按所有者角色适配，不能直接借用抢占流程。
+第一条查询服务进程，第二条读取任务等业务记录；只读查询不需要也不续租 Router 租约。面板所有者操作有明确入口，不借用 Router 接管流程。
 
 两条查询不能互相替代：进程存活不证明 Router 已绑定、来源可用或任务正在推进。
 
@@ -145,7 +145,7 @@ rtk proxy node --experimental-transform-types bin/osa.ts --state /absolute/osa-s
 | 重启 OSA | 恢复服务连接与记录，核对现有执行状态 |
 | 关闭插件面板 | 关闭一个界面，不删除业务记录，也不等同于停止任务 |
 
-**现状差异：** [现有 supervisor](../scripts/osa-supervisor.mjs) 会自动恢复被单次 `osa-service stop` 停掉的服务。旧操作手册要求先卸载托管才能持续停止。新版应沿用原版尊重人工停止的语义，并提供清楚的操作结果；不能直接把旧脚本包装成一个行为不符的“停止”按钮。
+**实现更新（2026-11-07）：** 手动 `osa-service stop` 保存停止意图，[supervisor](../scripts/osa-supervisor.mjs) 进入 `paused-owner`，不自动拉起；明确 `start` 后恢复。低磁盘等托管器内部停止不设置人工停止标记。
 
 现有具体操作参见 [运行手册](p4/RUNBOOK.md)，其中历史账号、模型、窗口编号和并发数不是新安装的默认配置。执行维护前核对本机实际配置。
 
@@ -167,7 +167,7 @@ OSA 沿用这个责任划分，优先复用现有本机服务托管。Orca 负�
 
 个人多项目共用来源接入和准入机制，项目内保存仓库关系及已有约定。发现仓库不代表已授权执行，改变项目默认位置也不移动在途工作。
 
-当前代码里的固定模型、强制两轮审查和旧组件层级，不因设置页面需要字段就变成新版要求。哪些可以编辑、何时生效，按真实实现展示。
+旧固定模型、强制两轮审查已移除，旧组件记录仍用于兼容工程绑定，不成为面板必填业务层级。哪些可以编辑、何时生效，按真实实现展示。
 
 ### 管理接口
 

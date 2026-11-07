@@ -69,16 +69,12 @@ export class Store implements Repositories {
 
   routerNotices(): unknown[] {
     return [...this.list('notice'), ...this.tickets.list().flatMap(ticket => {
-      const assignment = latestAssignment(ticket), report = assignment?.report
-      const progressId = report && key('progress', ticket.id, assignment!.id, report.at, report.state, report.summary)
-      const acknowledged = progressId && this.get<{at: number}>('router-notice-ack', progressId)
-      const progressDue = !acknowledged || (report?.state === 'waiting' && Date.now() - acknowledged.at >= 5 * 60_000)
+      const assignment = latestAssignment(ticket)
+      const binding = assignment && this.get<{settled?: string; finished?: boolean}>('orca-assignment', assignment.id)
       const pending = ticket.inputs.filter(input => input.kind === 'trigger' && input.human && !input.context && !this.get('input-resolution', input.id))
       return [
-        ...(!ticket.ended && report && ['progress', 'waiting'].includes(report.state) && !ticket.attention && progressDue
-          ? [{ id: progressId, ticketId: ticket.id, kind: 'progress', text: report.summary, action: report.state === 'waiting' ? 'Unfinished goal: determine and route the next authorized step; do not wait for unrelated tasks.' : 'Relay this task’s new progress independently.' }] : []),
-        ...(!ticket.ended && pending.length && Date.now() - Date.parse(pending[0].at) >= 120_000
-          ? [{ id: `inputs:${ticket.id}:${pending.map(i => i.id).join(',')}`, ticketId: ticket.id, kind: 'inputs', text: 'Owner inputs still require a processing report.', inputIds: pending.map(i => i.id) }] : []),
+        ...(!ticket.ended && pending.length && (binding?.settled || binding?.finished) && Date.now() - Date.parse(pending[0].at) >= 120_000
+          ? [{ id: `inputs:${ticket.id}:${pending.map(i => i.id).join(',')}`, ticketId: ticket.id, kind: 'inputs', text: 'Execution ended with inputs still awaiting a processing report.', inputIds: pending.map(i => i.id) }] : []),
         ...(!ticket.ended && ticket.attention && !this.get('outbox', key('attention-reply', ticket.attention.id))
           ? [{ id: ticket.attention.id, ticketId: ticket.id, kind: 'attention', text: ticket.attention.question }] : []),
         ...(ticket.answers ?? []).map(triggerId => ({ id: `answer:${ticket.id}:${triggerId}`, ticketId: ticket.id, triggerId, kind: 'answer', text: this.get<{summary: string}>('answer', key('answer', ticket.id, triggerId))?.summary })),

@@ -12,7 +12,7 @@ import { App, type Request } from '../src/app.ts'
 const cleanup: (() => void)[] = []
 afterEach(() => { vi.restoreAllMocks(); for (const fn of cleanup.splice(0)) fn() })
 
-function setup(twoLayer = false, stallMs?: number, maxExecutors?: number) {
+function setup(twoLayer = false, stallMs?: number, maxExecutors?: number, agent?: string) {
   const dir = mkdtempSync(join(tmpdir(), 'osa-orca-'))
   execFileSync('git', ['init', '--quiet', dir])
   execFileSync('git', ['-C', dir, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'fixture'])
@@ -91,7 +91,7 @@ if (requestId) s.requests[requestId]=r;
 if (s.dropOnce === command || s.dropOnce === group + ':' + command) { delete s.dropOnce; save(); process.exit(17); }
 output(r);
 `, { mode: 0o755 })
-  const options = { repository: dir, cli, twoLayer, stallMs, maxExecutors, osaCommand: "'/node path' --experimental-transform-types '/osa path' --state '/state path'",
+  const options = { repository: dir, cli, twoLayer, stallMs, maxExecutors, agent, osaCommand: "'/node path' --experimental-transform-types '/osa path' --state '/state path'",
     report: async (request: Request): Promise<unknown> => new App(store, executor, 'owner').acceptReport(request) }
   let executor = new OrcaExecutor(store, options)
   const makeEngine = () => new Engine({ repo: store, executor,
@@ -327,7 +327,7 @@ describe('OrcaExecutor durable effects', () => {
     expect(f.state().created).toBe(1)
   })
 
-  it('records failed native recovery attempts and keeps retries within the same Task and local limit', async () => {
+  it('records failed native recovery attempts and keeps explicit retries within the same Task', async () => {
     const f = setup()
     f.update({ startState: 'failed', retryState: 'failed' })
     f.executor.start(f.ticket, f.assignment); await f.tick()
@@ -336,8 +336,9 @@ describe('OrcaExecutor durable effects', () => {
     expect(f.state().created).toBe(2)
     expect(f.store.get<any>('execution-attempt', 'dispatch-2')).toMatchObject({ outcome: 'failed', recoveredFrom: 'dispatch-1' })
     await f.executor.retryTicket(f.engine, f.ticket.id)
-    await expect(f.executor.retryTicket(f.engine, f.ticket.id)).rejects.toThrow('Recovery limit')
-    expect(f.state().created).toBe(3)
+    await f.executor.retryTicket(f.engine, f.ticket.id)
+    expect(f.state().created).toBe(4)
+    expect(f.store.get<any>('execution-attempt', 'dispatch-4')).toMatchObject({ outcome: 'failed', recoveredFrom: 'dispatch-3' })
     expect(f.calls().filter(call => call.args.includes('--retry-of')).every(call => call.args[call.args.indexOf('--task') + 1] === 'task-1')).toBe(true)
   })
 
@@ -393,34 +394,38 @@ describe('OrcaExecutor durable effects', () => {
     expect(f.state().created).toBe(1)
   })
 
-  it('recovery is bounded and records terminal outcomes immediately', async () => {
+  it('allows retry when a retained child has positively exited', async () => {
     const f = setup()
     f.executor.start(f.ticket, f.assignment); await f.tick()
-    for (let attempt = 0; attempt < 2; attempt++) {
+    f.update({ workerState: 'stopped', dispatchStatus: 'failed', childRuns: [{ id: 'child-run', coordinator_handle: 'worker-1' }],
+      workers: [...f.state().workers, { dispatchId: 'child', runId: 'child-run', terminalState: 'retained', projection: { liveness: { verdict: 'exited' } } }] })
+    await f.executor.retryTicket(f.engine, f.ticket.id)
+    expect(f.state().created).toBe(2)
+  })
+
+  it('explicit recovery follows native limits and records each terminal outcome', async () => {
+    const f = setup()
+    f.executor.start(f.ticket, f.assignment); await f.tick()
+    for (let attempt = 0; attempt < 3; attempt++) {
       f.update({ workerState: 'stopped', dispatchStatus: 'failed' })
       await f.executor.retryTicket(f.engine, f.ticket.id)
     }
-    f.update({ workerState: 'stopped', dispatchStatus: 'failed' })
-    await expect(f.executor.retryTicket(f.engine, f.ticket.id)).rejects.toThrow('Recovery limit')
-    expect(f.state().created).toBe(3)
+    expect(f.state().created).toBe(4)
     expect(f.store.get<any>('execution-attempt', 'dispatch-1').outcome).toBe('failed')
     expect(f.store.get<any>('execution-attempt', 'dispatch-2').outcome).toBe('failed')
   })
-  it('prompts P2 decomposition and mandatory independent review without duplicate workers after restart', async () => {
-    const f = setup(true)
-    f.executor.start(f.ticket, f.assignment)
-    await f.tick()
+  it.each([false, true])('lets the Executor plan and follow project review requirements (twoLayer=%s)', async twoLayer => {
+    const f = setup(twoLayer)
+    f.executor.start(f.ticket, f.assignment); await f.tick()
     const args = f.calls().find(call => call.args[1] === 'worker-start').args
     const spec = args[args.indexOf('--spec') + 1]
-    expect(spec).toContain('run-create')
-    expect(spec).toContain('--agent claude')
-    expect(spec).toContain('OSA_REVIEW')
-    expect(spec).toContain('maximum two review rounds')
-    expect(spec).toContain('review snapshot')
-    expect(spec).toContain('review record')
-    expect(spec).not.toContain('P1: execute yourself')
-    f.restart()
-    await f.tick()
+    expect(spec).toContain('follow review requirements from the owner and project')
+    expect(spec).toContain('After starting independent child work, end your turn')
+    expect(spec).not.toContain('--agent claude')
+    expect(spec).not.toContain('maximum two review rounds')
+    expect(spec).not.toContain('do not create child workers or reviews')
+    expect(spec).not.toContain('check --wait')
+    f.restart(); await f.tick()
     expect(f.state().created).toBe(1)
   })
 
@@ -450,6 +455,53 @@ describe('OrcaExecutor durable effects', () => {
     expect(f.state().created).toBe(2)
     expect(f.state().worktrees).toHaveLength(1)
     expect(f.store.tickets.get(ticket.id)?.assignments).toHaveLength(2)
+  })
+
+  it('uses the configured agent for launch and recovery', async () => {
+    const f = setup(false, undefined, undefined, 'claude')
+    f.executor.start(f.ticket, f.assignment); await f.tick()
+    f.update({ workerState: 'stopped', dispatchStatus: 'failed' })
+    await f.executor.retryTicket(f.engine, f.ticket.id)
+    for (const call of f.calls().filter(call => call.args[1] === 'worker-start'))
+      expect(call.args[call.args.indexOf('--agent') + 1]).toBe('claude')
+  })
+
+  it('creates and reports a workspace for each selected repository', async () => {
+    const f = setup(false, undefined, 2), second = mkdtempSync(join(tmpdir(), 'osa-second-'))
+    cleanup.push(() => rmSync(second, { recursive: true, force: true }))
+    execFileSync('git', ['init', '--quiet', second])
+    execFileSync('git', ['-C', second, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'fixture'])
+    const firstTarget = { projectId: 'p', componentId: 'c', locationId: 'one', hostId: 'local', repository: f.dir, kind: 'git' }
+    const secondTarget = { ...firstTarget, locationId: 'two', repository: second }
+    f.store.put('project', 'p', { id: 'p' }); f.store.put('component', 'c', { id: 'c' })
+    for (const id of ['one', 'two']) f.store.put('location', id, { id })
+    f.store.put('ticket-target', f.ticket.id, { ...firstTarget, ticketId: f.ticket.id, boundAt: 'now', repositories: [firstTarget, secondTarget] })
+    f.executor.start(f.ticket, f.assignment); await f.tick()
+    const workspaces = new Projects(f.store).workspaces(f.ticket.id)
+    expect(workspaces.map(workspace => workspace.locationId)).toEqual(['one', 'two'])
+    expect(workspaces.map(workspace => workspace.directory)).toEqual([join(f.dir, 'small-change'), join(second, 'small-change')])
+    const args = f.calls().find(call => call.args[1] === 'worker-start').args
+    expect(args[args.indexOf('--spec') + 1]).toContain(join(second, 'small-change'))
+    const overlapping = { ...f.ticket, id: 'overlap', execution: { name: 'overlap', directory: f.dir, assignment: 'Overlap' } }
+    f.store.tickets.save(overlapping)
+    f.store.put('ticket-target', overlapping.id, { ...firstTarget, ticketId: overlapping.id, boundAt: 'now', repositories: [firstTarget, secondTarget] })
+    f.store.put('ticket-workspace', 'overlap:two', { ...workspaces[1], ticketId: overlapping.id })
+    expect((f.executor as any).canStart(overlapping, 'overlap-assignment')).toBe(false)
+    expect(f.store.get<any>('notice', 'queue:overlap').text).toContain('workspace occupied')
+    f.restart(); await f.tick()
+    expect(f.state().worktrees).toHaveLength(2)
+    expect(f.state().created).toBe(1)
+    f.done(); await f.tick()
+    const previous = f.store.tickets.get(f.ticket.id)!
+    previous.ended = { by: 'human', outcome: 'completed', at: new Date().toISOString() }; f.store.tickets.save(previous)
+    const next = { ...previous, id: 'next', ended: undefined, execution: { name: 'next', directory: '', assignment: 'Continue' }, assignments: [{ id: 'next-assignment', state: 'pending' as const, createdAt: previous.createdAt }] }
+    f.store.tickets.save(next)
+    f.store.put('ticket-target', next.id, { ...firstTarget, ticketId: next.id, boundAt: 'now', repositories: [firstTarget, secondTarget] })
+    f.store.put('task-plan', next.id, { ticketId: next.id, priority: 0, dependsOn: [], resources: [], createdAt: next.createdAt, continueFrom: previous.id })
+    f.executor.start(next, next.assignments[0]); await f.tick()
+    expect(new Projects(f.store).workspaces(next.id).map(workspace => workspace.directory)).toEqual(workspaces.map(workspace => workspace.directory))
+    expect(f.state().worktrees).toHaveLength(2)
+    expect(f.state().created).toBe(2)
   })
 
   it('preserves new inputs while settled-worker cleanup is still uncertain', async () => {
@@ -1047,6 +1099,25 @@ describe('settlement reconciliation', () => {
     expect(f.store.get<any>('orca-assignment','assignment-1').finished).not.toBe(true)
     expect(f.state().created).toBe(1)
   })
+  it.each([
+    [{ workerState: 'succeeded', projection: { liveness: { verdict: 'unverifiable' } } }, true],
+    [{ workerState: 'ready', projection: { liveness: { verdict: 'live' } } }, false],
+    [{ projection: { liveness: { verdict: 'unverifiable', reason: 'missing_status' } } }, false],
+    [{ workerState: 'succeeded', projection: { liveness: { verdict: 'live' } } }, false],
+    [{ terminalState: 'released', projection: { liveness: { verdict: 'live' } } }, false],
+  ])('handles retained child execution evidence %j', async (child, finished) => {
+    const f = setup(); f.executor.start(f.ticket, f.assignment); await f.tick()
+    f.update({ childRuns: [{ id: 'child-run', coordinator_handle: 'worker-1' }],
+      workers: [...f.state().workers, { dispatchId: 'child', runId: 'child-run', terminalState: 'retained', ...child }] })
+    f.done(); await f.tick()
+    const ticket = f.store.tickets.get(f.ticket.id)!
+    ticket.inputs.push({ id: 'late', kind: 'text', text: 'Continue', at: new Date().toISOString() }); ticket.undelivered.push('late'); f.store.tickets.save(ticket)
+    f.executor.deliver(ticket, ticket.assignments[0]!); await f.tick(); await f.tick()
+    expect(!!f.store.get<any>('orca-assignment', f.assignment.id).finished).toBe(finished)
+    expect(f.store.tickets.get(ticket.id)!.assignments.length).toBe(finished ? 2 : 1)
+    if (!finished) expect(f.store.get<any>('notice', `poll:${f.assignment.id}`).text).toContain('child')
+  })
+
   it('does not send late inputs to an inactive Dispatch and continues them after safe release', async () => {
     const f=setup(); f.executor.start(f.ticket,f.assignment); await f.tick(); settled(f)
     const ticket=f.store.tickets.get(f.ticket.id)!

@@ -17,9 +17,13 @@ export class RouterWake {
   constructor(private readonly store: Store, private readonly options: { cli: string; repository: string; osaCommand: string; sessionRpc?: typeof sessionRpc }) {}
 
   private async cli(args: string[]): Promise<Json> {
-    const { stdout } = await execute(this.options.cli, [...args, '--json', ...(args[0] === 'orchestration' ? ['--full'] : [])], { cwd: this.options.repository, timeout: 15_000, maxBuffer: 2_000_000 })
+    // The service uses its own sender anchor, not the agent session that launched it.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('ORCA_')))
+    let stdout: string
+    try { ({ stdout } = await execute(this.options.cli, [...args, '--json', ...(args[0] === 'orchestration' ? ['--full'] : [])], { cwd: this.options.repository, env, timeout: 15_000, maxBuffer: 2_000_000 })) }
+    catch (error) { stdout = (error as {stdout?: string}).stdout ?? ''; if (!stdout.trim()) throw error }
     const response = JSON.parse(stdout)
-    if (response?.ok !== true || !response.result) throw new Error(`Orca ${response?.error?.code ?? 'invalid response'}`)
+    if (response?.ok !== true || !response.result) throw new Error(`Orca ${response?.error?.code ?? 'invalid response'}: ${response?.error?.message ?? 'missing result'}`)
     return response
   }
 
@@ -90,7 +94,7 @@ export class RouterWake {
     if (!wake || (wake.receipt && ((added && elapsed >= 15_000) || elapsed >= 5 * 60_000))) {
       wake = { id: randomUUID(), bindingId: binding.id, requestId: randomUUID(), args: [
         'orchestration', 'send', '--from', binding.terminal, '--to', `orca_session_id:${binding.sessionId}`, '--type', 'status',
-        '--subject', 'OSA pending Router work', '--body', `Pending OSA work is available. At your next safe checkpoint run ${this.options.osaCommand} router wait with your current lease. After service updates, read the current skills/super-agent-router/SKILL.md before routing. Only if you have no lease, run router attach first. Preserve the single Router lease; if another owner holds it, leave work pending. This attention is not a routing decision.`,
+        '--subject', 'OSA pending Router work', '--body', `Pending OSA work is available. At your next safe checkpoint run ${this.options.osaCommand} router wait --timeout 0 with your current lease. After service updates, read the current skills/super-agent-router/SKILL.md before routing. Only if you have no lease, run router attach first. Preserve the single Router lease; if another owner holds it, leave work pending. Process the current work, then yield for native events. This attention is not a routing decision.`,
       ] }
       this.store.atomic(() => {
         this.store.put('router-wake', wake!.id, wake)

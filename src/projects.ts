@@ -6,7 +6,9 @@ import type { Ticket } from '../vendor/dsh-core/src/index.ts'
 import type { GitHubConfig } from './app.ts'
 import type { Store } from './store.ts'
 
-export type TicketTarget = { ticketId: string; projectId: string; componentId: string; locationId: string; hostId: string; repository: string; kind: 'git' | 'folder'; repoId?: string; baseBranch?: string; github?: GitHubConfig; boundAt: string }
+export type RepositoryTarget = { projectId: string; componentId: string; locationId: string; hostId: string; repository: string; kind: 'git' | 'folder'; repoId?: string; baseBranch?: string; github?: GitHubConfig }
+export type TicketTarget = RepositoryTarget & { ticketId: string; boundAt: string; repositories?: RepositoryTarget[] }
+export type TicketWorkspace = { ticketId: string; locationId: string; repository: string; directory: string; name: string; worktreeId?: string }
 export type TaskPlan = { ticketId: string; priority: number; dependsOn: string[]; goalId?: string; resources: string[]; createdAt: string; workspace?: 'isolated' | 'inspect'; continueFrom?: string }
 type Row = { id: string; name: string; updatedAt: string; archived?: boolean; paused?: boolean; projectId?: string; componentId?: string; hostId?: string; repository?: string; kind?: 'git' | 'folder'; repoId?: string; baseBranch?: string; github?: GitHubConfig; projectIds?: string[]; acceptanceTicketId?: string; source?: string; version?: string; text?: string; supersededBy?: string; goalId?: string; locationId?: string; purpose?: string; closedAt?: string; category?: 'engineering' | 'decision'; ticketId?: string; assignmentId?: string }
 type Options = Record<string, string>
@@ -52,10 +54,26 @@ export class Projects {
   }
 
   resolve(o: Options, sourceRepository?: string): Omit<TicketTarget, 'ticketId' | 'boundAt'> {
+    if (o.locations) {
+      if (o.location || o.component) throw new Error('Choose --locations or --location/--component')
+      const locations = list(o.locations).map(id => this.select('location', id))
+      if (!locations.length) throw new Error('Choose at least one repository location')
+      const components = locations.map(location => this.select('component', location.componentId))
+      const project = this.select('project', o.project ?? components[0].projectId)
+      if (components.some(component => component.projectId !== project.id)) throw new Error('Selected repositories must belong to the chosen project')
+      const repositories: RepositoryTarget[] = locations.map((location, i) => ({ projectId: project.id, componentId: components[i].id, locationId: location.id,
+        hostId: location.hostId!, repository: location.repository!, kind: location.kind!,
+        ...(location.repoId ? { repoId: location.repoId } : {}), ...(location.baseBranch ? { baseBranch: location.baseBranch } : {}), ...(components[i].github ? { github: components[i].github } : {}) }))
+      if (new Set(repositories.map(target => `${target.hostId}:${target.repository}`)).size !== repositories.length) throw new Error('Select each repository only once')
+      if (sourceRepository && !repositories.some(target => target.github?.repository === sourceRepository)) throw new Error('Source repository is outside the selected task targets')
+      return { ...repositories[0], ...(repositories.length > 1 ? { repositories } : {}) }
+    }
     let components = this.rows('component').filter(row => !row.archived)
+    const selectedLocation = o.location ? this.select('location', o.location) : undefined
+    if (selectedLocation) components = components.filter(row => row.id === selectedLocation.componentId)
     if (sourceRepository) components = components.filter(row => row.github?.repository === sourceRepository)
     if (o.component) components = components.filter(row => row.id === o.component || row.name === o.component)
-    const project = this.select('project', o.project, this.rows('project').filter(row => !sourceRepository && !o.component || components.some(c => c.projectId === row.id)))
+    const project = this.select('project', o.project, this.rows('project').filter(row => !sourceRepository && !o.component && !o.location || components.some(c => c.projectId === row.id)))
     const component = this.select('component', o.component, components.filter(row => row.projectId === project.id))
     const location = this.select('location', o.location, this.rows('location').filter(row => row.componentId === component.id))
     return { projectId: project.id, componentId: component.id, locationId: location.id, hostId: location.hostId!, repository: location.repository!, kind: location.kind!,
@@ -66,10 +84,10 @@ export class Projects {
     this.store.atomic(() => {
       const existing = this.store.get<TicketTarget>('ticket-target', ticket.id)
       if (existing) {
-        if (['project', 'component', 'location'].some(key => o[key]) || sourceRepository) {
+        if (['project', 'component', 'location', 'locations'].some(key => o[key])) {
           const target = this.resolve(o, sourceRepository)
           if (Object.entries(target).some(([key, value]) => JSON.stringify(value) !== JSON.stringify(existing[key as keyof TicketTarget]))) throw new Error('Ticket target is immutable')
-        }
+        } else if (sourceRepository && !this.targets(ticket.id).some(target => target.github?.repository === sourceRepository)) throw new Error('Ticket target is immutable')
         return
       }
       if (!this.rows('project').length) return
@@ -77,6 +95,21 @@ export class Projects {
       this.store.put('ticket-target', ticket.id, { ...target, ticketId: ticket.id, boundAt: now() })
       this.plan(ticket.id, o, ticket)
     })
+  }
+
+  targets(ticketId: string): RepositoryTarget[] {
+    const target = this.store.get<TicketTarget>('ticket-target', ticketId)
+    if (!target) return []
+    const { ticketId: _ticket, boundAt: _bound, repositories, ...primary } = target
+    return repositories ?? [primary]
+  }
+
+  workspaces(ticketId: string): TicketWorkspace[] {
+    const saved = this.store.list<TicketWorkspace>('ticket-workspace').filter(workspace => workspace.ticketId === ticketId)
+    const ticket = this.store.tickets.get(ticketId), target = this.store.get<TicketTarget>('ticket-target', ticketId)
+    if (ticket?.execution?.directory && target && !saved.some(workspace => workspace.locationId === target.locationId))
+      saved.unshift({ ticketId, locationId: target.locationId, repository: target.repository, directory: ticket.execution.directory, name: ticket.execution.name })
+    return saved
   }
 
   private plan(ticketId: string, o: Options, prepared?: Ticket, adoptGoal = false): TaskPlan {
@@ -97,7 +130,7 @@ export class Projects {
     if (plan.goalId && (!goal || goal.archived || goal.closedAt || !target || !goal.projectIds?.includes(target.projectId))) throw new Error('Goal does not authorize this project or is closed')
     if (adoptGoal && (old?.goalId && old.goalId !== plan.goalId || goal?.acceptanceTicketId)) throw new Error('Adoption cannot move worklines or alter a joint acceptance goal')
     // Reuse only an explicit workline and exact target, never a similarly named task.
-    if (!adoptGoal && !old && goal && target && !o.workspace && !plan.continueFrom) {
+    if (!adoptGoal && !old && goal && target && !o.workspace && !o.publish && !plan.continueFrom && this.targets(ticketId).length === 1) {
       const peers = this.store.list<TaskPlan>('task-plan').filter(p => p.ticketId !== ticketId && p.goalId === goal.id && p.workspace !== 'inspect')
         .map(p => this.store.tickets.get(p.ticketId)!).filter(t => t && this.store.get<TicketTarget>('ticket-target', t.id)?.locationId === target.locationId)
       if (peers.some(t => !t.ended)) throw new Error('Workline already has open work at this location; attach the request or explicitly choose an isolated parallel task')
@@ -111,6 +144,8 @@ export class Projects {
       if (plan.continueFrom === ticketId || !previous?.ended || !previous.execution?.directory || !target || !previousTarget
         || target.repository !== previousTarget.repository || target.componentId !== previousTarget.componentId || target.hostId !== previousTarget.hostId || target.locationId !== previousTarget.locationId)
         throw new Error('Continuation requires an ended ticket in the same component and repository')
+      const identity = (id: string) => this.targets(id).map(t => [t.locationId, t.repository, t.hostId]).sort((a, b) => a[0].localeCompare(b[0]))
+      if (JSON.stringify(identity(ticketId)) !== JSON.stringify(identity(plan.continueFrom))) throw new Error('Continuation must preserve all repository targets')
     }
     if (this.rows('goal').some(g => g.acceptanceTicketId === ticketId && g.id !== plan.goalId)) throw new Error('Acceptance task cannot leave its goal')
     for (const goalId of new Set([old?.goalId, plan.goalId])) {
@@ -135,9 +170,11 @@ export class Projects {
   blocked(ticketId: string): string | undefined {
     const target = this.store.get<TicketTarget>('ticket-target', ticketId)
     if (target) {
-      const project = this.store.get<Row>('project', target.projectId), component = this.store.get<Row>('component', target.componentId), location = this.store.get<Row>('location', target.locationId)
-      if (!project || project.archived || project.paused || !component || component.archived || !location || location.archived) return 'Project or target paused/archived/unavailable'
-      if (target.hostId !== 'local' || target.kind !== 'git') return 'Direct execution requires a local Git target'
+      for (const selected of this.targets(ticketId)) {
+        const project = this.store.get<Row>('project', selected.projectId), component = this.store.get<Row>('component', selected.componentId), location = this.store.get<Row>('location', selected.locationId)
+        if (!project || project.archived || project.paused || !component || component.archived || !location || location.archived) return 'Project or target paused/archived/unavailable'
+        if (selected.hostId !== 'local' || selected.kind !== 'git') return 'Direct execution requires a local Git target'
+      }
     } else if (this.rows('project').length) return 'Ticket has no explicit execution target'
     const plan = this.store.get<TaskPlan>('task-plan', ticketId)
     const goal = plan?.goalId && this.store.get<Row>('goal', plan.goalId)
@@ -146,10 +183,10 @@ export class Projects {
       const bindings = this.store.list<{ticketId: string; finished?: boolean; releaseState?: string}>('orca-assignment').filter(b => b.ticketId === plan.continueFrom)
       if (!bindings.length || bindings.some(b => !b.finished || b.releaseState === 'retained')) return 'Previous workspace resources remain unresolved or retained'
     }
-    const directory = this.directory(ticketId)
-    if (directory && this.store.list<{directory: string; state: string}>('workspace-cleanup').some(c => c.directory === directory && ['removing', 'unknown', 'removed'].includes(c.state))) return 'Workspace cleanup holds or removed this directory'
+    const directories = this.targets(ticketId).map(target => this.directory(ticketId, target.locationId)).filter(Boolean)
+    if (this.store.list<{directory: string; state: string}>('workspace-cleanup').some(c => directories.includes(c.directory) && ['removing', 'unknown', 'removed'].includes(c.state))) return 'Workspace cleanup holds or removed this directory'
     for (const id of new Set([...(plan?.dependsOn ?? []), ...children])) {
-      if (!this.successful(id)) return `Dependency ${id} lacks current successful settlement/review`
+      if (!this.successful(id)) return `Dependency ${id} lacks current successful settlement`
     }
     return undefined
   }
@@ -158,9 +195,7 @@ export class Projects {
     const ticket = this.store.tickets.get(ticketId), assignment = ticket?.assignments.at(-1)
     const execution = assignment && this.store.get<{ dispatchId?: string; outcome?: string }>('execution', assignment.id)
     const binding = assignment && this.store.get<{ dispatchId?: string; settled?: string }>('orca-assignment', assignment.id)
-    const review = assignment && this.store.get<{ verdict?: string; executorDispatchId?: string; blocked?: boolean }>('review', assignment.id)
-    return !!(ticket?.ended && ['completed', 'merged'].includes(ticket.ended.outcome) && assignment?.report?.state === 'ready' && binding?.settled && binding.dispatchId && execution?.dispatchId === binding.dispatchId && execution.outcome === 'succeeded' &&
-      (this.store.get('config', 'two-layer') !== true || (review?.verdict === 'approve' && !review.blocked && review.executorDispatchId === binding.dispatchId)))
+    return !!(ticket?.ended && ['completed', 'merged'].includes(ticket.ended.outcome) && assignment?.report?.state === 'ready' && binding?.settled && binding.dispatchId && execution?.dispatchId === binding.dispatchId && execution.outcome === 'succeeded')
   }
 
   private goalOverview(goal: Row): unknown {
@@ -180,21 +215,25 @@ export class Projects {
     return ticketId
   }
 
-  directory(ticketId: string): string | undefined {
+  directory(ticketId: string, locationId?: string): string | undefined {
     const ticket = this.store.tickets.get(ticketId), plan = this.store.get<TaskPlan>('task-plan', ticketId)
-    return ticket?.execution?.directory || (plan?.workspace === 'inspect' ? this.store.get<TicketTarget>('ticket-target', ticketId)?.repository
-      : plan?.continueFrom ? this.store.tickets.get(plan.continueFrom)?.execution?.directory : undefined)
+    const targets = this.targets(ticketId), selected = locationId ? targets.find(target => target.locationId === locationId) : targets[0]
+    return this.workspaces(ticketId).find(workspace => workspace.locationId === selected?.locationId)?.directory
+      || (!locationId || locationId === targets[0]?.locationId ? ticket?.execution?.directory : undefined)
+      || (plan?.workspace === 'inspect' ? selected?.repository
+        : plan?.continueFrom ? this.workspaces(plan.continueFrom).find(workspace => workspace.locationId === selected?.locationId)?.directory : undefined)
   }
 
   context(ticketId: string): unknown {
     const target = this.store.get<TicketTarget>('ticket-target', ticketId), plan = this.store.get<TaskPlan>('task-plan', ticketId)
-    return { target, plan, dependencies: [...new Set([...(plan?.dependsOn ?? []), ...(plan?.continueFrom ? [plan.continueFrom] : [])])].map(id => {
+    const targets = this.targets(ticketId)
+    return { target, targets, workspaces: this.workspaces(ticketId), plan, dependencies: [...new Set([...(plan?.dependsOn ?? []), ...(plan?.continueFrom ? [plan.continueFrom] : [])])].map(id => {
       const ticket = this.store.tickets.get(id), assignment = ticket?.assignments.at(-1)
-      return { ticketId: id, target: this.store.get('ticket-target', id), directory: ticket?.execution?.directory, report: assignment?.report, handoff: this.store.get('handoff', id),
+      return { ticketId: id, target: this.store.get('ticket-target', id), directory: ticket?.execution?.directory, workspaces: this.workspaces(id), report: assignment?.report, handoff: this.store.get('handoff', id),
         execution: assignment && this.store.get('execution', assignment.id), review: assignment && this.store.get('review', assignment.id), successful: this.successful(id) }
     }), goal: plan?.goalId && this.store.get<Row>('goal', plan.goalId) ? this.goalOverview(this.store.get<Row>('goal', plan.goalId)!) : undefined,
-      knowledge: this.rows('knowledge').filter(row => !row.archived && !row.supersededBy && (row.projectIds?.includes('*') || (!!target && row.projectIds?.includes(target.projectId))) && (!row.componentId || row.componentId === target?.componentId)
-        && (!row.locationId || row.locationId === target?.locationId) && (!row.goalId || row.goalId === plan?.goalId)),
+      knowledge: this.rows('knowledge').filter(row => !row.archived && !row.supersededBy && (row.projectIds?.includes('*') || (!!target && row.projectIds?.includes(target.projectId))) && (!row.componentId || targets.some(target => row.componentId === target.componentId))
+        && (!row.locationId || targets.some(target => row.locationId === target.locationId)) && (!row.goalId || row.goalId === plan?.goalId)),
       handoff: this.store.get('handoff', ticketId), observedAt: now() }
   }
 
@@ -215,16 +254,16 @@ export class Projects {
     const directory = join(dirname(resolve(this.store.path)), 'worklines', id)
     mkdirSync(directory, { recursive: true, mode: 0o700 })
     const file = join(directory, 'WORK.md'), temporary = join(directory, randomUUID() + '.tmp')
-    const body = { goal: goal || undefined, target, knowledge: context.knowledge,
+    const body = { goal: goal || undefined, target, targets: this.targets(ticketId), workspaces: this.workspaces(ticketId), knowledge: context.knowledge,
       tasks: tasks.map(id => { const t = this.store.tickets.get(id)!; return { id, title: t.title, scope: t.mandate.scope, directory: this.directory(id), ended: t.ended,
-        report: t.assignments.at(-1)?.report, handoff: this.store.get('handoff', id) } }), observedAt: now() }
+        workspaces: this.workspaces(id), report: t.assignments.at(-1)?.report, handoff: this.store.get('handoff', id) } }), observedAt: now() }
     writeFileSync(temporary, '# Engineering brief\n\nGenerated from OSA records. Do not edit this projection; use memo/report commands. Recheck live environment and credentials before acting.\n\n```json\n' + JSON.stringify(body, null, 2) + '\n```\n', { mode: 0o600 })
     renameSync(temporary, file)
     return file
   }
 
   memo(ticketId: string, assignmentId: string, action: string, o: Options): unknown {
-    const target = this.store.get<TicketTarget>('ticket-target', ticketId), plan = this.store.get<TaskPlan>('task-plan', ticketId)
+    const targets = this.targets(ticketId), target = o.location ? targets.find(target => target.locationId === o.location) : targets[0], plan = this.store.get<TaskPlan>('task-plan', ticketId)
     if (!target) throw new Error('Memo requires a bound execution target')
     if (action === 'list') return (this.context(ticketId) as {knowledge: Row[]}).knowledge
     if (!['add', 'supersede'].includes(action)) throw new Error('Use memo list|add|supersede')

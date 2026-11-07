@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { key, type Engine, type OutboundMessage, type ReplyStatus } from '../vendor/dsh-core/src/index.ts'
+import { key, latestAssignment, type Engine, type OutboundMessage, type ReplyStatus } from '../vendor/dsh-core/src/index.ts'
 import type { Store } from './store.ts'
+import { Projects } from './projects.ts'
 
 type Options = { repository: string; owner: { id: string; login: string }; cli?: string }
 type Json = Record<string, unknown>
@@ -110,7 +111,9 @@ export class GitHub {
   }
 
   private ingest(engine: Engine, item: Json, number: number, kind: string, since: string, isPr: boolean): void {
-    if (!this.owner(item.user)) return
+    if (item.user === null) return
+    const user = object(item.user), actorId = String(integer(user.id)), login = string(user.login)
+    const human = user.type === 'User' && !login.endsWith('[bot]')
     const id = integer(item.id), at = time(item.updated_at ?? item.submitted_at ?? item.created_at)
     if (at < since) return
     const body = item.body == null ? '' : string(item.body)
@@ -121,10 +124,10 @@ export class GitHub {
     if (!text.trim()) return
     // Issue updated_at also changes for timeline activity, including our own replies.
     engine.receive({ id: key('github', this.options.repository, kind, String(id), kind === 'issue' ? '' : at, text), source: 'github',
-      actor: { source: 'github', id: this.options.owner.id }, human: true, addressed: 'direct', at, text,
+      actor: { source: 'github', id: actorId }, human, addressed: 'direct', at, text,
       threads: [this.ref(number)], channel: this.channel(number),
       url: `https://github.com/${this.options.repository}/${isPr ? 'pull' : 'issues'}/${number}`,
-      meta: { repository: this.options.repository, number, isPr, kind, nativeId: id } })
+      meta: { repository: this.options.repository, number, isPr, kind, nativeId: id, login, actorType: user.type } })
     const thread = this.store.threads.get(`github:${this.ref(number).id}`)
     if (thread) this.store.threads.save({ ...thread, meta: { ...thread.meta, repository: this.options.repository, number, isPr } })
   }
@@ -136,16 +139,21 @@ export class GitHub {
   }
 
   private targetMatches(ticketId: string): boolean {
-    const target = this.store.get<{ ticketId: string; github?: { repository: string; owner: Options['owner'] } }>('ticket-target', ticketId)
-    if (!target) return !this.store.list('project').length && !this.store.list('ticket-target').length && this.store.list('github.cursor').length === 1
-    return target.ticketId === ticketId && target.github?.repository === this.options.repository
-      && target.github.owner.id === this.options.owner.id && target.github.owner.login === this.options.owner.login
+    const targets = new Projects(this.store).targets(ticketId)
+    if (!targets.length) return !this.store.list('project').length && !this.store.list('ticket-target').length && this.store.list('github.cursor').length === 1
+    return targets.some(target => target.github?.repository === this.options.repository
+      && target.github.owner.id === this.options.owner.id && target.github.owner.login === this.options.owner.login)
   }
 
   private bind(engine: Engine, pr: Json): void {
     if (!this.ownedPull(pr)) return
     const number = integer(pr.number), ref = this.ref(number), branch = string(object(pr.head).ref)
-    const candidates = this.store.tickets.open().filter(ticket => ticket.execution?.name === branch && this.targetMatches(ticket.id))
+    const projects = new Projects(this.store)
+    const candidates = this.store.tickets.open().filter(ticket => {
+      const target = projects.targets(ticket.id).find(target => target.github?.repository === this.options.repository)
+      const workspace = projects.workspaces(ticket.id).find(workspace => workspace.locationId === target?.locationId)
+      return this.targetMatches(ticket.id) && (workspace?.name ?? ticket.execution?.name) === branch
+    })
     if (candidates.length !== 1) return
     const ticket = candidates[0], followed = ticket.follows?.find(follow => follow.thread === `github:${ref.id}`)
     if (this.store.tickets.open().some(other => other.id !== ticket.id && other.follows?.some(follow => follow.thread === `github:${ref.id}` && follow.own))) return
@@ -215,8 +223,22 @@ export class GitHub {
         }
       })
       await attempt(`state:${number}`, async () => {
-        if (!this.ownedPull(pr) || !this.store.tickets.open().some(ticket => this.targetMatches(ticket.id) && ticket.follows?.some(follow => follow.own && follow.thread === `github:${this.ref(number).id}`))) return
-        if (pr.state === 'closed') this.store.atomic(() => engine.threadClosed(this.ref(number), pr.merged_at ? 'merged' : 'closed', time(pr.merged_at ?? pr.closed_at)))
+        if (!this.ownedPull(pr)) return
+        const tickets = this.store.tickets.open().filter(ticket => this.targetMatches(ticket.id) && ticket.follows?.some(follow => follow.own && follow.thread === `github:${this.ref(number).id}`))
+        if (!tickets.length) return
+        if (pr.state === 'closed') this.store.atomic(() => {
+          const outcome = pr.merged_at ? 'merged' : 'closed', at = time(pr.merged_at ?? pr.closed_at)
+          const thread = this.store.threads.get(`github:${this.ref(number).id}`)
+          if (thread) this.store.threads.save({...thread, meta: {...thread.meta, prState: {state: 'closed', outcome, at}}})
+          // Historical PRs cannot settle a new multi-repository round; polling replays closure after its current ready report.
+          const incomplete = tickets.some(ticket => {
+            const authorization = this.store.get<{repositories?: {repository: string}[]}>('publish-authorization', ticket.id)
+            const multiRepository = new Projects(this.store).targets(ticket.id).length > 1 || (authorization?.repositories?.length ?? 0) > 1
+            return (multiRepository && latestAssignment(ticket)?.report?.state !== 'ready') || authorization?.repositories?.some(target =>
+              !ticket.follows?.some(follow => follow.own && follow.thread.startsWith(`github:${target.repository}:`)))
+          })
+          if (!incomplete) engine.threadClosed(this.ref(number), outcome, at)
+        })
         else await this.ci(engine, pr)
       })
     }

@@ -55,6 +55,7 @@ export async function supervise(config, configPath) {
   lock.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE')
   const statusPath = join(config.state, 'supervisor.json')
   const service = command => JSON.parse(execFileSync(process.execPath, [launcher, command, '--state', config.state,
+    ...(command === 'status' ? [] : ['--supervised']),
     ...(command === 'start' ? (configPath ? configAt(configPath, config) : config).serveArgs : [])], { encoding: 'utf8', timeout: command === 'stop' ? 40_000 : 25_000, stdio: ['ignore', 'pipe', 'pipe'] }))
   let stopping = false, lastReport, epoch, failures = 0, nextAttemptAt = 0, stableSince = 0, wasRunning = false
   process.on('SIGTERM', () => { stopping = true })
@@ -73,7 +74,11 @@ export async function supervise(config, configPath) {
       try {
         const runtime = orcaRuntime(config)
         const current = service('status')
-        if (!runtime || (epoch && runtime !== epoch)) {
+        if (current.manualStopped) {
+          if (current.running) service('stop')
+          wasRunning = false; stableSince = 0; failures = 0; nextAttemptAt = 0
+          report('paused-owner', 'OSA was stopped by its owner; start it explicitly to resume')
+        } else if (!runtime || (epoch && runtime !== epoch)) {
           if (current.running) service('stop')
           epoch = runtime; wasRunning = false; stableSince = 0
           report('waiting-orca', 'Orca is stopped or its runtime changed')
@@ -165,6 +170,7 @@ async function main() {
   mkdirSync(config.state, { recursive: true, mode: 0o700 })
   writeFileSync(plist, launchAgent(configPath, config.state), { mode: 0o600, flag: 'wx' })
   execFileSync('/usr/bin/plutil', ['-lint', plist], { stdio: 'inherit' })
+  rmSync(join(config.state, 'manual-stop'), { force: true })
   launchctl(['bootstrap', domain, plist])
   console.log(JSON.stringify({ installed: target, config: configPath, status: join(config.state, 'supervisor.json') }))
 }

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'vitest'
+import { afterEach, expect, test, vi } from 'vitest'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,7 +8,7 @@ import { Store } from '../src/store.ts'
 import type { Executor } from '../vendor/dsh-core/src/index.ts'
 
 const dirs: string[] = [], stores: Store[] = []
-afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
+afterEach(() => { vi.useRealTimers(); for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'osa-app-')); dirs.push(dir)
   const store = new Store(join(dir, 'db')); stores.push(store)
@@ -304,7 +304,7 @@ test('question, acknowledgement, answer and clearing use durable core reply iden
 })
 
 
-test('shared chat is only a reply address; explicit attachment and scope revision stay on one ticket', () => {
+test('shared chat is only a reply address; explicit attachment preserves the original mandate', () => {
   const f=setup()
   for (const id of ['daily','online','faq']) {
     f.call(['intake'],{id,text:id,thread:'management-chat'})
@@ -319,8 +319,9 @@ test('shared chat is only a reply address; explicit attachment and scope revisio
   f.call(['route','attach'],{ticket:ticket.id,trigger:'phase2',scope:'Complete online recovery including phase two'})
   const auth={ticket:ticket.id,assignment,token:'test'}
   const context=f.call(['read'],auth), input=context.ticket.inputs[0].id
-  expect(context.ticket.mandate.scope).toContain('phase two')
-  expect(context.scopeRevisions).toHaveLength(1)
+  expect(context.ticket.mandate.scope).toBe('online')
+  expect(context.triggers.some((trigger:any) => trigger.text === 'Logged in, continue phase two')).toBe(true)
+  expect(context.scopeRevisions).toHaveLength(0)
   expect(f.store.tickets.list().filter(t=>t.id!==ticket.id).every(t=>t.inputs.length===0)).toBe(true)
   expect(()=>f.call(['report','ready'],{...auth,summary:'Done'})).toThrow('Unprocessed')
   f.call(['ack'],{...auth,inputs:input})
@@ -343,10 +344,12 @@ test('routing preserves owner words and cannot inject Router scopes or notes', (
   f.call(['route', 'attach'], { ticket: ticketId, trigger: 'owner-correction', scope: 'Invented deployment authorization', note: 'Stop at the first error' })
   f.call(['route', 'attach'], { ticket: ticketId, trigger: 'owner-correction', scope: 'Different Router rewrite' })
   ticket = f.store.tickets.get(ticketId)!
-  expect(ticket.mandate.scope).toBe(`${original}\n\nOwner followup (owner-correction):\n${correction}`)
+  expect(ticket.mandate.scope).toBe(original)
+  expect(ticket.execution?.assignment).toBe(original)
+  expect(f.store.triggers.get('owner-correction')?.text).toBe(correction)
   expect(ticket.inputs).toHaveLength(1)
   expect(ticket.inputs[0]).not.toHaveProperty('note')
-  expect(f.store.list('scope-revision')).toHaveLength(1)
+  expect(f.store.list('scope-revision')).toHaveLength(0)
   f.call(['intake'], { id: 'second-original', text: '另一个原始请求' })
   expect(f.call(['route', 'accept'], { trigger: 'second-original', title: 'Another' }).ticketId).toBeTruthy()
 })
@@ -366,16 +369,14 @@ test('status retains the original refusal after later progress replaces the curr
   expect(status.reportReceipts.find((r: any) => r.id === 'refusal-1').result.assignments[0].report.summary).toBe(original)
 })
 
-test('unfinished waiting produces its own actionable progress notice and acknowledgement persists', () => {
+test('ordinary progress remains readable without waking Router', () => {
   const f=setup(); f.call(['intake'],{id:'work',text:'Two steps'})
   const {ticketId}=f.call(['route','accept'],{trigger:'work',title:'Work',scope:'Both steps'})
   const assignment=f.store.tickets.get(ticketId)!.assignments[0].id
   f.app.engine.assignmentStarted(ticketId,assignment); f.store.put('capability',assignment,{token:'test'})
   f.call(['report','waiting'],{ticket:ticketId,assignment,token:'test',summary:'Step one done, step two remains'})
-  const notice=f.call(['router','wait']).notices.find((n:any)=>n.kind==='progress')
-  expect(notice.action).toContain('next authorized step')
-  f.call(['router','ack'],{message:notice.id})
-  expect(f.call(['router','wait']).notices.some((n:any)=>n.id===notice.id)).toBe(false)
+  expect(f.call(['router','wait']).notices.some((notice:any)=>notice.kind==='progress')).toBe(false)
+  expect(f.call(['owner','status']).taskProgress.find((task:any)=>task.ticketId===ticketId).report.summary).toBe('Step one done, step two remains')
 })
 
 
@@ -388,4 +389,188 @@ test('scope correction invalidates an earlier read even before the followup is a
   f.call(['intake'],{id:'new-scope',text:'Continue stage two'})
   f.call(['route','attach'],{ticket:ticketId,trigger:'new-scope',scope:'Both stages authorized'})
   expect(()=>f.call(['report','ready'],{...auth,summary:'Stage one done'})).toThrow('Read the current')
+})
+
+
+test('owner status and project management never acquire or renew a Router lease', () => {
+  const f = setup(), owner = (action: string, options: Record<string,string> = {}) => f.app.handle({command:['owner',action], options, id:'panel-rpc'}) as any
+  f.store.delete('router', 'lease')
+  expect(owner('status').tickets).toEqual([])
+  owner('project-add', {id:'panel-project', name:'Panel project'})
+  expect(f.store.get('router','lease')).toBeUndefined()
+  const lease = {token:'held-by-router', expires:Date.now() + 1000}
+  f.store.put('router','lease',lease)
+  owner('status'); f.app.handle({command:['status'],options:{},id:'read'})
+  expect(f.store.get('router','lease')).toEqual(lease)
+  expect(() => owner('execute',{text:'arbitrary shell'})).toThrow('Unknown owner')
+})
+
+test('panel requests remain candidates until routed and keep owner project, locations and verbatim text', () => {
+  const f=setup(), owner=(action:string,options:Record<string,string>={}) => f.app.handle({command:['owner',action],options,id:'rpc'}) as any
+  execFileSync('git',['init','-q',f.dir])
+  owner('project-add',{id:'p',name:'Project'})
+  owner('repository-add',{id:'local',name:'Repository',project:'p',repository:f.dir})
+  const options={id:'request',project:'p',locations:'local',text:'  修复日期。\n不要推送。  '}
+  const result=owner('request',options)
+  owner('request',options)
+  expect(f.store.tickets.list()).toHaveLength(0)
+  const status=owner('status',{project:'p'})
+  expect(status.candidates).toHaveLength(1)
+  expect(status.triggers).toEqual([expect.objectContaining({id:'panel:request',source:'panel',text:options.text,actor:{source:'panel',id:'owner'},meta:{projectId:'p',locationIds:['local']}})])
+  expect(() => owner('request',{...options,text:'Replacement'})).toThrow('different content')
+  const {ticketId}=f.call(['route','accept'],{trigger:result.id,title:'Fix date'})
+  expect(f.store.get<any>('ticket-target',ticketId).locationId).toBe('local')
+  expect(f.store.tickets.get(ticketId)?.mandate.scope).toBe(options.text)
+  expect(owner('status').routingHistory).toEqual(expect.arrayContaining([expect.objectContaining({ticketId})]))
+  expect(() => f.call(['route','accept'],{trigger:result.id,title:'Wrong project',project:'missing'})).toThrow()
+})
+
+test('owner comments attach once, preserve mandate and return answers and results to the local task', () => {
+  const f=setup(), owner=(action:string,options:Record<string,string>={}) => f.app.handle({command:['owner',action],options,id:'rpc'}) as any
+  execFileSync('git',['init','-q',f.dir])
+  owner('project-add',{id:'p',name:'Project'}); owner('repository-add',{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  owner('request',{id:'task',text:'Find the cause',project:'p'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'panel:task',title:'Cause'})
+  const ticket=f.store.tickets.get(ticketId)!, assignment=ticket.assignments[0].id, auth={ticket:ticketId,assignment,token:'secret'}
+  f.store.put('capability',assignment,{token:'secret'}); f.app.engine.assignmentStarted(ticketId,assignment)
+  f.call(['report','waiting'],{...auth,summary:'Need detail',question:'Which date?'})
+  const comment={id:'comment',ticket:ticketId,text:'  导出日期，保持时区。\n  '}
+  owner('comment',comment); owner('comment',comment)
+  const read=f.call(['read'],auth), input=read.ticket.inputs.find((input:any)=>input.triggerId==='panel:comment')
+  expect(read.ticket.mandate.scope).toBe('Find the cause')
+  expect(read.ticket.inputs.filter((input:any)=>input.triggerId==='panel:comment')).toHaveLength(1)
+  expect(read.triggers.find((trigger:any)=>trigger.id==='panel:comment').text).toBe(comment.text)
+  f.call(['ack'],{...auth,inputs:input.id})
+  f.call(['report','progress'],{...auth,inputs:input.id,answers:'panel:comment',summary:'Timezone preserved',question:''})
+  f.call(['read'],auth)
+  f.store.put('config','two-layer',true)
+  f.call(['report','ready'],{...auth,summary:'Cause fixed'})
+  const status=owner('status'), mails=status.outbox.filter((mail:any)=>mail.channel.source==='panel')
+  expect(mails).toEqual(expect.arrayContaining([expect.objectContaining({text:'Which date?',status:'sent'}),expect.objectContaining({text:'Timezone preserved',status:'sent',channel:expect.objectContaining({thread:`task:${ticketId}`})}),expect.objectContaining({text:'Cause fixed',status:'sent'})]))
+  expect(status.inputResolutions).toEqual([expect.objectContaining({inputId:input.id,summary:'Timezone preserved'})])
+  expect(f.call(['router','wait']).messages).toEqual([])
+  owner('comment',{id:'after-result',ticket:ticketId,text:'Verify another export'})
+  expect(f.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  expect(f.store.tickets.get(ticketId)?.mandate.scope).toBe('Find the cause')
+})
+
+test('invalid panel submissions retain the exact original and reason without wrong-target delivery', () => {
+  const f=setup(), owner=(action:string,options:Record<string,string>={}) => f.app.handle({command:['owner',action],options,id:'rpc'}) as any
+  owner('project-add',{id:'p',name:'Project'})
+  const rejected={id:'bad',project:'missing',text:'  Never lose this request  '}
+  expect(() => owner('request',rejected)).toThrow()
+  expect(owner('status').rejectedSubmissions).toEqual([expect.objectContaining({...rejected,error:expect.any(String)})])
+  expect(f.store.triggers.get('panel:bad')).toBeUndefined()
+  expect(() => owner('comment',{id:'comment',ticket:'missing',text:'Exact comment'})).toThrow('existing task')
+  expect(owner('status').rejectedSubmissions.at(-1).text).toBe('Exact comment')
+  expect(() => f.app.handle({command:['owner','status'],options:[] as any,id:'invalid'})).toThrow('Invalid request')
+})
+
+test('publish with explicit continuation is rejected before accepting work', () => {
+  const f=setup(), config={repository:'owner/project',owner:{id:'42',login:'owner'}}, app=new App(f.store,f.executor,'owner',config)
+  const call=(command:string[],options:Record<string,string>)=>app.handle({command,options:{lease:f.store.get<any>('router','lease').token,...options},id:'rpc'}) as any
+  call(['intake'],{id:'publish',text:'Publish this change'})
+  expect(() => call(['route','accept'],{trigger:'publish',title:'Publish',publish:'true','continue-from':'prior'})).toThrow('cannot continue')
+  expect(f.store.tickets.list()).toHaveLength(0)
+})
+
+
+test('owner stop records the actual owner and refuses further comments without a Router lease', () => {
+  const f=setup(), owner=(action:string,options:Record<string,string>={})=>f.app.handle({command:['owner',action],options,id:'rpc'}) as any
+  execFileSync('git',['init','-q',f.dir])
+  owner('project-add',{id:'p',name:'Project'}); owner('repository-add',{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  owner('request',{id:'stop',project:'p',text:'Investigate'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'panel:stop',title:'Investigation'})
+  f.store.delete('router','lease')
+  expect(owner('stop',{ticket:ticketId,reason:'Stop this task'}).ended).toMatchObject({by:'human',outcome:'stopped',reason:'Stop this task'})
+  expect(owner('status').ownerActions).toEqual([expect.objectContaining({action:'stop',ticketId,actor:{source:'panel',id:'owner'}})])
+  expect(() => owner('comment',{id:'too-late',ticket:ticketId,text:'Continue'})).toThrow('stopped')
+  expect(f.store.get('router','lease')).toBeUndefined()
+})
+
+
+test('panel attachment cannot cross the original project or selected repositories', () => {
+  const f=setup(), owner=(action:string,options:Record<string,string>)=>f.app.handle({command:['owner',action],options,id:'rpc'}) as any
+  for(const project of ['a','b']) owner('project-add',{id:project,name:project})
+  for(const [id,project] of [['a1','a'],['a2','a'],['b1','b']]) {
+    const repository=join(f.dir,id); execFileSync('git',['init','-q',repository])
+    owner('repository-add',{id,name:id,project,repository})
+  }
+  owner('request',{id:'original',project:'a',locations:'a1',text:'Fix project A'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'panel:original',title:'A'})
+  const target=f.store.get('ticket-target',ticketId), mandate=f.store.tickets.get(ticketId)?.mandate
+  owner('request',{id:'foreign-project',project:'b',locations:'b1',text:'Fix project B'})
+  expect(()=>f.call(['route','attach'],{ticket:ticketId,trigger:'panel:foreign-project'})).toThrow('another project')
+  owner('request',{id:'foreign-repository',project:'a',locations:'a2',text:'Change another repository'})
+  expect(()=>f.call(['route','attach'],{ticket:ticketId,trigger:'panel:foreign-repository'})).toThrow('outside this task')
+  expect(()=>owner('comment',{id:'outside-comment',ticket:ticketId,locations:'a2',text:'Expand this task'})).toThrow('outside this task')
+  expect(f.store.tickets.get(ticketId)?.inputs).toHaveLength(0)
+  expect(f.store.get('ticket-target',ticketId)).toEqual(target)
+  expect(f.store.tickets.get(ticketId)?.mandate).toEqual(mandate)
+  expect(f.call(['owner','status']).candidates.flatMap((candidate:any)=>candidate.triggers.map((trigger:any)=>trigger.id))).toEqual(expect.arrayContaining(['panel:foreign-project','panel:foreign-repository']))
+  owner('request',{id:'same-target',project:'a',locations:'a1',text:'Another clue'})
+  f.call(['route','attach'],{ticket:ticketId,trigger:'panel:same-target'})
+  expect(f.store.tickets.get(ticketId)?.inputs).toHaveLength(1)
+})
+
+
+test('only Router candidate reads start the core deadline, whose bounded retries recover by original owner trigger', () => {
+  vi.useFakeTimers({toFake:['Date']}); vi.setSystemTime('2026-11-07T00:00:00Z')
+  const f=setup()
+  f.call(['intake'],{id:'unread',text:'Preserve this unanswered owner request'})
+  const first=f.call(['owner','status']).candidates[0]
+  vi.setSystemTime(Date.now()+30*60_000); f.app.engine.evaluateDue()
+  expect(f.call(['owner','status']).candidates[0].evalId).toBe(first.evalId)
+  expect(f.store.threads.active()[0].evaluating?.delivered).toBeUndefined()
+  f.call(['router','wait'])
+  const delivered=f.store.threads.active()[0].evaluating!
+  expect(delivered.delivered).toBe(new Date().toISOString())
+  vi.setSystemTime(Date.now()+60_000); f.call(['router','wait'])
+  expect(f.store.threads.active()[0].evaluating).toEqual(delivered)
+  for(let round=0;round<3;round++) {
+    vi.setSystemTime(Date.now()+300_001); f.app.engine.evaluateDue()
+    if(round<2) {
+      expect(f.store.threads.active()[0].evaluating?.delivered).toBeUndefined()
+      f.call(['router','wait'])
+    }
+  }
+  expect(f.call(['owner','status']).candidates).toHaveLength(0)
+  expect(f.call(['owner','status']).routingHistory).toEqual([expect.objectContaining({kind:'unavailable',triggerIds:['unread']})])
+  const lease=f.store.get('router','lease')
+  expect(f.call(['owner','reevaluate'],{trigger:'unread',lease:''})).toEqual({triggerId:'unread',requeued:true})
+  expect(f.call(['owner','reevaluate'],{trigger:'unread',lease:''})).toEqual({triggerId:'unread',requeued:false})
+  expect(f.call(['owner','status']).candidates[0].triggers[0].id).toBe('unread')
+  expect(f.store.threads.active()[0].evaluating?.delivered).toBeUndefined()
+  expect(f.store.list('core.trigger')).toHaveLength(1)
+  expect(f.store.get('router','lease')).toEqual(lease)
+})
+
+test('owner reevaluation cannot steal an active ticket input or admit a foreign actor', () => {
+  const f=setup(); f.call(['intake'],{id:'original',text:'Do the authorized work'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'original',title:'Work'})
+  f.call(['intake'],{id:'owned-followup',text:'A clue within the task'})
+  f.call(['route','attach'],{ticket:ticketId,trigger:'owned-followup'})
+  const disposition=f.store.triggers.disposition('owned-followup')
+  expect(()=>f.call(['owner','reevaluate'],{trigger:'owned-followup'})).toThrow('worker decides')
+  expect(f.store.triggers.disposition('owned-followup')).toEqual(disposition)
+  f.app.engine.receive({id:'foreign-reevaluate',source:'router',actor:{source:'router',id:'someone-else'},human:true,addressed:'direct',at:new Date().toISOString(),text:'Not owner work',threads:[{source:'router',id:'foreign-reevaluate'}],meta:{}})
+  expect(()=>f.call(['owner','reevaluate'],{trigger:'foreign-reevaluate'})).toThrow('Only in-scope owner')
+  expect(()=>f.call(['owner','reevaluate'],{trigger:'missing'})).toThrow('Only in-scope owner')
+})
+
+
+test('unavailable panel requests recover in their original project with unchanged source and words', () => {
+  const f=setup()
+  for(const id of ['p','other']) f.call(['owner','project-add'],{id,name:id})
+  const original={id:'panel-request',project:'p',text:'  Preserve my exact original words  '}
+  f.call(['owner','request'],original)
+  f.app.engine.decide('panel:panel-request',{kind:'unavailable',reason:'Router unavailable'})
+  const trigger=f.store.triggers.get('panel:panel-request')
+  expect(()=>f.call(['owner','reevaluate'],{trigger:'panel:panel-request',project:'other'})).toThrow('project')
+  f.call(['project','pause'],{id:'p'})
+  expect(()=>f.call(['owner','reevaluate'],{trigger:'panel:panel-request'})).toThrow('project')
+  f.call(['project','resume'],{id:'p'})
+  expect(f.call(['owner','reevaluate'],{trigger:'panel:panel-request',project:'p'})).toEqual({triggerId:'panel:panel-request',requeued:true})
+  expect(f.store.triggers.get('panel:panel-request')).toEqual(trigger)
+  expect(f.call(['owner','status'],{project:'p'}).candidates[0].triggers[0]).toMatchObject({id:'panel:panel-request',source:'panel',text:original.text,meta:{projectId:'p'}})
 })

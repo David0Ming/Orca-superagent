@@ -24,7 +24,7 @@ const text = (value: unknown, label: string): string => {
 export class OrcaExecutor implements Executor {
   private readonly working = new Map<string, Promise<void>>()
   private retrying = new Map<string, Promise<unknown>>()
-  constructor(private readonly store: Store, private readonly options: { repository: string; cli: string; osaCommand: string; twoLayer?: boolean; stallMs?: number; model?: string; maxExecutors?: number; report?: (request: Request) => Promise<unknown> }) {
+  constructor(private readonly store: Store, private readonly options: { repository: string; cli: string; osaCommand: string; twoLayer?: boolean; stallMs?: number; agent?: string; model?: string; maxExecutors?: number; report?: (request: Request) => Promise<unknown> }) {
     if (!Number.isSafeInteger(options.maxExecutors ?? 1) || (options.maxExecutors ?? 1) < 1) throw new Error('maxExecutors must be a positive integer')
   }
 
@@ -60,7 +60,6 @@ export class OrcaExecutor implements Executor {
     }
     const pending = this.store.list<Recovery>('orca-recovery').find(item => item.assignmentId === binding.id && !item.done)
     if (pending) throw new Error('Recovery remains pending; inspect status before another request')
-    if (this.store.list<Recovery>('orca-recovery').filter(item => item.assignmentId === binding.id).length >= 2) throw new Error('Recovery limit reached; owner inspection required')
     let shown = await this.read(['orchestration', 'worker-show', '--dispatch', binding.dispatchId])
     if (shown.dispatch?.id !== binding.dispatchId || shown.dispatch?.taskId !== binding.taskId || shown.dispatch?.runId !== binding.runId
       || shown.projection?.liveness?.verdict === 'live')
@@ -95,7 +94,6 @@ export class OrcaExecutor implements Executor {
       binding.finished = false
       this.save(binding)
       engine.note(ticketId, `Recovery after confirmed ${shown.worker.state} of ${binding.dispatchId}. Inspect the existing worktree, git history and external state; preserve completed work and do not repeat external effects. Previous report: ${current.assignments.at(-1)?.report?.summary ?? 'none'}. Read all unread inputs before continuing.`)
-      this.store.delete('review', binding.id)
     })
     // A lane already in flight may predate the newly queued recovery.
     await this.working.get(binding.id)
@@ -115,8 +113,12 @@ export class OrcaExecutor implements Executor {
       if (!Array.isArray(runs.runs)) throw new Error('Cannot verify child Runs')
       for (const run of runs.runs.filter((item: Json) => item.coordinator_handle === binding.terminal)) {
         const children = await this.read(['orchestration', 'worker-list', '--run', text(run.id, 'child Run ID'), '--include-remote'])
-        if (!Array.isArray(children.workers) || children.page?.hasMore || children.workers.some((child: Json) => child.dispatchId !== binding.dispatchId && child.terminalState !== 'released'))
-          throw new Error('Child worker resources remain unresolved; inspect before recovery')
+        if (!Array.isArray(children.workers) || children.page?.hasMore) throw new Error(`Cannot verify child workers in Run ${run.id}`)
+        for (const child of children.workers.filter((item: Json) => item.dispatchId !== binding.dispatchId)) {
+          const liveness = child.projection?.liveness?.verdict
+          if (liveness === 'live' || (child.terminalState !== 'released' && liveness !== 'exited' && !['succeeded', 'failed'].includes(child.workerState)))
+            throw new Error(`Child worker resources remain unresolved: ${child.dispatchId ?? 'unknown'} (state ${child.workerState ?? 'unknown'}, liveness ${liveness ?? 'unknown'}, terminal ${child.terminalState ?? 'unknown'}); inspect before recovery`)
+        }
       }
       cursor = runs.nextCursor || undefined
       if (cursor && cursors.has(cursor)) throw new Error('Run pagination did not advance')
@@ -144,7 +146,7 @@ export class OrcaExecutor implements Executor {
       if (!this.canStart(current, binding.id)) return
     }
     const receipt = await this.mutation(recovery.id, ['orchestration', 'worker-start', '--task', binding.taskId!, '--retry-of', recovery.previous,
-      '--worktree', `path:${ticket.execution!.directory}`, '--agent', 'codex', ...(this.options.model ? ['--model', this.options.model] : []), '--run', binding.runId!, '--from', binding.anchor!])
+      '--worktree', `path:${ticket.execution!.directory}`, '--agent', this.options.agent ?? 'codex', ...(this.options.model ? ['--model', this.options.model] : []), '--run', binding.runId!, '--from', binding.anchor!])
     if (receipt.taskId !== binding.taskId || receipt.runId !== binding.runId) throw new Error('Recovery did not return the original Task; inspect saved receipt')
     const dispatchId = text(receipt.dispatchId, 'recovery dispatch'), terminal = receipt.effects?.find((item: Json) => item.kind === 'terminal' && item.role === 'agent')?.id
     if (receipt.state === 'ready') text(terminal, 'recovery terminal')
@@ -236,29 +238,44 @@ export class OrcaExecutor implements Executor {
   }
 
   private async verifyWorkspace(ticket: Ticket): Promise<void> {
-    if (!ticket.execution?.directory) return
-    const target = this.store.get<TicketTarget>('ticket-target', ticket.id)
-    if (!target) return // Legacy tests and existing unregistered placements retain their contract.
+    const projects = new Projects(this.store), targets = projects.targets(ticket.id)
+    if (!targets.length) return
+    for (const target of targets) {
+      const directory = projects.directory(ticket.id, target.locationId)
+      if (!directory) throw new Error(`Missing workspace for ${target.locationId}`)
+      await this.verifyTargetWorkspace(ticket, target, directory)
+    }
+  }
+
+  private async verifyTargetWorkspace(ticket: Ticket, target: ReturnType<Projects['targets']>[number], directory: string): Promise<void> {
+    if (!isAbsolute(directory)) throw new Error('Ticket execution.directory must be absolute')
     const plan = this.store.get<TaskPlan>('task-plan', ticket.id)
     if (plan?.workspace === 'inspect') {
-      if (realpathSync(ticket.execution.directory) !== realpathSync(target.repository)) throw new Error('Inspection directory changed')
+      if (realpathSync(directory) !== realpathSync(target.repository)) throw new Error('Inspection directory changed')
       return
     }
-    const common = async (directory: string) => realpathSync((await execute('git', ['-C', directory, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
-    if (realpathSync(ticket.execution.directory) === realpathSync(target.repository) || await common(ticket.execution.directory) !== await common(target.repository)) throw new Error('Execution workspace is not an isolated worktree of the frozen target')
-    const operation = this.store.get<Operation>('orca-operation', `worktree:${new Projects(this.store).workspaceOwner(ticket.id)}`)
+    const common = async (path: string) => realpathSync((await execute('git', ['-C', path, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
+    if (realpathSync(directory) === realpathSync(target.repository) || await common(directory) !== await common(target.repository)) throw new Error('Execution workspace is not an isolated worktree of the frozen target')
+    const projects = new Projects(this.store), owner = projects.workspaceOwner(ticket.id)
+    const primary = projects.targets(owner)[0]?.locationId === target.locationId
+    const operation = this.store.get<Operation>('orca-operation', `worktree:${owner}${primary ? '' : ':' + target.locationId}`)
     const ownedPath = operation?.response && this.result(operation.response).worktree?.path
-    if (!ownedPath || realpathSync(ownedPath) !== realpathSync(ticket.execution.directory)) throw new Error('Execution workspace has no ticket-owned creation receipt')
+    if (!ownedPath || realpathSync(ownedPath) !== realpathSync(directory)) throw new Error('Execution workspace has no ticket-owned creation receipt')
   }
 
   private canStart(ticket: Ticket, assignmentId: string): boolean {
     const projects = new Projects(this.store), blocked = projects.blocked(ticket.id)
     const active = this.store.list<Binding>('orca-assignment').filter(item => item.id !== assignmentId && !item.finished)
     const resources = this.store.get<TaskPlan>('task-plan', ticket.id)?.resources ?? []
+    const directories = (id: string) => {
+      const targets = projects.targets(id)
+      return (targets.length ? targets.map(target => projects.directory(id, target.locationId)) : [projects.directory(id)]).filter((path): path is string => !!path).map(path => realpathSync(path))
+    }
+    const paths = directories(ticket.id)
     const conflict = active.some(item => {
       const other = this.store.tickets.get(item.ticketId)
       return resources.some(resource => this.store.get<TaskPlan>('task-plan', item.ticketId)?.resources.includes(resource)) ||
-        (!!projects.directory(ticket.id) && !!other && !!projects.directory(other.id) && realpathSync(projects.directory(ticket.id)!) === realpathSync(projects.directory(other.id)!))
+        (!!other && directories(other.id).some(path => paths.includes(path)))
     })
     const reason = blocked ?? (active.length >= (this.options.maxExecutors ?? 1) ? 'Executor capacity reached' : conflict ? 'Shared resource or workspace occupied' : undefined)
     if (reason) this.notice(`queue:${ticket.id}`, ticket.id, reason)
@@ -506,96 +523,88 @@ export class OrcaExecutor implements Executor {
     const run = text(this.store.get<Binding>('orca-assignment', assignmentId)?.runId, 'report Run')
     const report = `${osa} --cli ${quote(this.options.cli)} --report-to ${quote(`run:${run}`)} --terminal '<your worker handle from the Orca preamble>'`
     const plan = this.store.get<TaskPlan>('task-plan', ticket.id)
-    return `Target: ${ticket.title}\nOwner request (verbatim):\n${ticket.mandate.scope}\nTarget location: ${JSON.stringify(this.store.get<TicketTarget>('ticket-target', ticket.id) ?? { repository: this.repository(ticket.id) })}
+    return `Target: ${ticket.title}\nOwner request (verbatim):\n${ticket.mandate.scope}\nTarget location: ${JSON.stringify(this.store.get<TicketTarget>('ticket-target', ticket.id) ?? { repository: this.repository(ticket.id) })}\nWorkspaces: ${JSON.stringify(new Projects(this.store).workspaces(ticket.id))}
 You are the Executor, a peer of the Router. You own exploration, technical planning, implementation and debugging. Resolve technical friction within the owner's authorization and report afterwards. If a premise is false (wrong project, missing data, already implemented, or the request conflicts with the owner's intent), stop and explain the evidence and where the work belongs; do not force it or add mechanisms. Preserve refusals and disagreements explicitly in your domain report, with original wording and evidence for the owner.
-${plan?.workspace === 'inspect' ? 'Use the existing repository for inspection. Do not change its code, Git state or local project files. Place investigation notes outside the repository. Any authorized SSH action still requires its own evidence; local review alone does not certify remote state.' : 'Use this ticket’s assigned workspace; preserve inherited files and prior completed work.'} ${this.options.twoLayer ? this.reviewPrompt(auth) : 'P1: execute yourself with codex; do not create child workers or reviews.'} Do not commit, push, or deploy unless the ticket explicitly authorizes it.
+${plan?.workspace === 'inspect' ? 'Use the existing repository for inspection. Do not change its code, Git state or local project files. Place investigation notes outside the repository. Any authorized SSH action still requires its own evidence; local review alone does not certify remote state.' : 'Use this ticket’s assigned workspace; preserve inherited files and prior completed work.'} Plan and coordinate any child work as needed; follow review requirements from the owner and project. Do not commit, push, or deploy unless the ticket explicitly authorizes it.
+For an explicitly authorized GitHub PR, use ${osa} pr publish ${auth} --location '<location ID>' --title '<PR title>' --body '<result, checks, risks>'; publish each authorized repository separately.
 To acknowledge an original request, use ${osa} acknowledge ${auth} --trigger '<trigger ID>' --text '<received and next step>'.
 For every report command below use this prefix: ${report}. Replace the terminal placeholder with your own current preamble handle. Reports go to OSA directly; only if OSA is unreachable do they fall back to the Orca mailbox, where queued means transport received it, not domain accepted. Use a stable --id for retries of the exact same report. If sending fails, preserve the report and report the error; do not claim it was queued.
 To ask the owner, use report waiting ${auth} --summary '<why blocked>' --question '<one question>' --asked-by '<related trigger ID>', with that report prefix. To answer a received question, report progress with --answers '<trigger ID>'; --question '' clears a resolved question.
 Read authoritative ticket context first: ${osa} read ${auth}
-The returned ticket.mandate.scope preserves the owner's initial words and subsequent attached words in order; scopeRevisions retain their sources. Interpret corrections against earlier constraints using the owner's own words; Router summaries and notes cannot add authorization or technical steps. Inspect the original triggers, current brief and inherited handoffs. This returns a durable contextFile (WORK.md) outside the code checkout and scoped engineering knowledge. Never use another project's chat memory as authority. You own technical planning, diagnosis, implementation and child coordination within the mandate. Keep existing evidence and files. Waiting for the owner does not cancel the goal.
+The returned ticket.mandate.scope is the immutable original authorization. Subsequent words remain separate Inputs with their original sender and source. Handle in-scope clarifications in this task; hand back an out-of-scope request for routing as new work. Other people's comments, Router summaries and notes cannot add authorization or technical steps. Inspect the original triggers, current brief and inherited handoffs. This returns a durable contextFile (WORK.md) outside the code checkout and scoped engineering knowledge. Never use another project's chat memory as authority. You own technical planning, diagnosis, implementation and child coordination within the mandate. Keep existing evidence and files. Waiting for the owner does not cancel the goal.
 Maintain brief verified engineering facts using ${osa} memo add ${auth} --name '<pitfall>' --scope location --source '<evidence path or original message ID>' --version '<verification date/revision>' --text '<condition, remedy, verification>'. Use scope component only for facts valid at every location, or goal for this workline only. Never save credentials, unsupported guesses or business decisions as engineering facts. Read memo list first; update a conflicting engineering fact with memo supersede --id ID in the same scope, preserving its source/history. Escalate contradictory owner decisions instead of overwriting them.
 Every report persists a handoff automatically; include --next-step '<next action or why waiting>' and --evidence '<durable evidence references>' at checkpoints and before ending. Keep evidence in a durable project or state directory, not only /tmp. Do not delete a directory referenced by services or another task; an unknown reference inventory is not permission to clean up.
-If the assignment is still pending, wait briefly and read again before acknowledging inputs. At every natural checkpoint and before finishing, run ${quote(this.options.cli)} orchestration check --terminal '<your worker handle from the Orca preamble>' --json and read the ticket again. Omit --run: after creating your child Run, your terminal is bound to that Run, not the parent service Run. A check error explicitly saying "bound to ... not ..." identifies a wrong Run argument; inspect run-current and your exact worker-show/dispatch-show before correcting that argument. A genuine superseded Dispatch must still stop; never reclaim the parent Run with run-use.
+If the assignment is still pending, wait briefly and read again before acknowledging inputs. When Orca wakes you with a check command, run it and read the ticket again. If you need to check manually, use ${quote(this.options.cli)} orchestration check --terminal '<your worker handle from the Orca preamble>' --json. Omit --run: after creating your child Run, your terminal is bound to that Run, not the parent service Run. A check error explicitly saying "bound to ... not ..." identifies a wrong Run argument; inspect run-current and your exact worker-show/dispatch-show before correcting that argument. A genuine superseded Dispatch must still stop; never reclaim the parent Run with run-use.
 Record each handled followup with report progress --inputs '<input IDs>' and a summary explaining what was applied, completed, superseded or blocked; ack alone is not a processing report. Before ready, account for every owner input. Continue safe authorized work after recoverable technical failures; only block the action that actually needs an owner decision.
-A progress report or acknowledgement is a checkpoint, not a reason to end the turn while authorized work remains. When waiting for child work, wait on your own bound Run with orchestration check --wait --timeout-ms 30000 and resume when it arrives; do not ask the owner to wake you. If work cannot continue, report the concrete missing premise or owner question, then settle the native attempt instead of silently leaving it dispatched.
+A progress report or acknowledgement is a checkpoint, not a reason to end the turn while authorized work remains. After starting independent child work, end your turn; Orca wakes you when a result or question arrives. Follow the current Orca orchestration guide and any receipt next action; do not poll or run wait loops. If work cannot continue, report the concrete missing premise or owner question, then settle the native attempt instead of silently leaving it dispatched.
 For each input actually read, run: ${osa} ack ${auth} --inputs '<original input IDs, comma separated>'
 When handling an Orca followup, preserve the original message ID from check and add --message '<original Orca message ID>' to that ack; only acknowledge its listed input IDs. If its receipt is not recorded yet, read again and retry the ack. Then acknowledge its Orca delivery via the same bound-Run check command with --ack. Deduplicate replays by message/input IDs.
 Before worker_done, report the domain result: ${report} report ready ${auth} --summary '<result, checks, risks>'
 Use blocked, failed, dropped, waiting, or progress instead of ready when appropriate. Completion of Orca alone is not a domain report. Finally send exactly one worker_done using the exact preamble command and matching outcome, then stop.`
   }
 
-  private reviewPrompt(auth: string): string {
-    const osa = this.options.osaCommand
-    return `P2: codex is the Executor/coordinator. Use Orca for all worker processes; do small changes yourself and decompose only when useful.
-The service Run is reserved for your parent’s completion inbox. Never run run-use on your injected parent Run, even to check status or record review.
-Before creating any child, load orca skills get orchestration and create your own Run with orchestration run-create; then worker-start --run <your Run> --worktree current. Never reuse the service coordinator Run for children. Preserve child Task/Dispatch IDs and reconcile worker-list/worker-show after interruption; never relaunch an uncertain worker.
-For a ticket explicitly authorizing a GitHub PR, commit the completed changes before review; publishing requires a clean committed worktree and HEAD is part of the fingerprint.
-Mandatory independent review: once implementation and checks finish and all editing children settle, launch a fresh --agent claude child in this same worktree, read-only, with the ticket scope and checks to review. Include this authenticated command in its spec: ${osa} review snapshot ${auth}
-The reviewer must obtain its own fingerprint before reviewing, check it again afterwards, and put exactly one standalone line in its genuine worker_done body: OSA_REVIEW {"verdict":"approve","fingerprint":"<snapshot fingerprint>","feedback":"<findings and checks>"}. Use verdict reject for findings requiring changes; the review task itself succeeds for either verdict. Preserve the preamble's three-sentence summary and exact Task/Dispatch IDs. If the workspace changes during review, review the new snapshot before settling.
-Wait for the review worker_done, then run ${osa} review record ${auth} --dispatch <reviewer Dispatch ID>. This program verifies independent Claude identity, parentage, settlement and current workspace; your own assertion is insufficient. Process the returned feedback. For an authorized GitHub PR, after approval run ${osa} pr publish ${auth} --title '<PR title>' --body '<result, checks, risks>' before reporting ready; the same command updates an existing PR on followup. After one rejection, fix it and request one fresh Claude review; maximum two review rounds. After a second rejection, or if two rounds cannot establish current approval, report blocked with the findings. Do not claim ready without recorded current approval.
-Release each settled child with worker-release before acknowledging its Orca delivery; finish all children before your own worker_done. Orca owns supervision, cleanup and process recovery; do not build another scheduler.`
-  }
-
   private async workspace(ticket: Ticket, name: string): Promise<string> {
-    if (ticket.execution?.directory) {
-      if (!isAbsolute(ticket.execution.directory)) throw new Error('Ticket execution.directory must be absolute')
-      await this.verifyWorkspace(ticket)
-      return ticket.execution.directory
-    }
-    const plan = this.store.get<TaskPlan>('task-plan', ticket.id)
-    const existing = new Projects(this.store).directory(ticket.id)
-    if (existing) {
-      if (plan?.continueFrom) {
-        const terminals = await this.read(['terminal', 'list', '--worktree', `path:${existing}`, '--limit', '1000'])
-        if (!Array.isArray(terminals.terminals) || terminals.truncated || terminals.terminals.length) throw new Error('Continuation workspace still has terminals; inspect ownership before reuse')
+    const projects = new Projects(this.store), registered = projects.targets(ticket.id)
+    const targets: ReturnType<Projects['targets']> = registered.length ? registered : [{ projectId: 'legacy', componentId: 'legacy', locationId: 'legacy', hostId: 'local', kind: 'git' as const, repository: this.options.repository }]
+    let primary = ''
+    for (const [index, target] of targets.entries()) {
+      const suffix = index ? `:${target.locationId}` : ''
+      const plan = this.store.get<TaskPlan>('task-plan', ticket.id)
+      let directory = registered.length ? projects.directory(ticket.id, target.locationId) : ticket.execution?.directory || undefined
+      if (directory) {
+        if (!isAbsolute(directory)) throw new Error('Ticket execution.directory must be absolute')
+        if (plan?.continueFrom && !projects.workspaces(ticket.id).some(item => item.locationId === target.locationId)) {
+          const terminals = await this.read(['terminal', 'list', '--worktree', `path:${directory}`, '--limit', '1000'])
+          if (!Array.isArray(terminals.terminals) || terminals.truncated || terminals.terminals.length) throw new Error('Continuation workspace still has terminals; inspect ownership before reuse')
+        }
+        if (registered.length) await this.verifyTargetWorkspace(ticket, target, directory)
+      } else {
+        const id = `worktree:${ticket.id}${suffix}`, marker = `osa ticket ${ticket.id}${suffix}`
+        let operation = this.store.get<Operation>('orca-operation', id)
+        if (!operation) {
+          operation = { id, requestId: randomUUID(), args: ['worktree', 'create', '--repo', `path:${target.repository}`, '--name', name, '--comment', marker, '--no-parent', ...(target.baseBranch ? ['--base-branch', target.baseBranch] : [])] }
+          this.store.put('orca-operation', id, operation)
+        }
+        if (!operation.response && operation.attempted) {
+          const listing = await this.read(['worktree', 'list', '--repo', `path:${target.repository}`])
+          const matches = listing.worktrees?.filter((item: Json) => item.comment === marker)
+          if (listing.truncated || matches?.length !== 1) throw new Error('Uncertain worktree creation; inspect before retrying')
+          operation.response = { ok: true, result: { worktree: matches[0] } }
+        }
+        if (!operation.response) {
+          operation.attempted = true
+          this.store.put('orca-operation', id, operation)
+          operation.response = await this.cli(operation.args)
+        }
+        this.store.put('orca-operation', id, operation)
+        directory = text(this.result(operation.response).worktree?.path, 'worktree directory')
+        if (!isAbsolute(directory)) throw new Error('Orca returned a relative worktree directory')
+        if (registered.length) await this.verifyTargetWorkspace(ticket, target, directory)
+        const branch = (await execute('git', ['-C', directory, 'symbolic-ref', '--short', 'HEAD'])).stdout.trim()
+        const renameId = `branch:${ticket.id}${suffix}`
+        let rename = this.store.get<{ branch: string; name: string; done?: boolean }>('orca-operation', renameId)
+        if (!rename) { rename = { branch, name }; this.store.put('orca-operation', renameId, { id: renameId, ...rename }) }
+        if (branch !== name) {
+          if (branch !== rename.branch || rename.done) throw new Error('Worktree branch changed externally; refusing rename')
+          await execute('git', ['-C', directory, 'branch', '-m', name])
+        }
+        const baseline = (await execute('git', ['-C', directory, 'rev-parse', 'HEAD'])).stdout.trim()
+        this.store.put('workspace-baseline', `${ticket.id}${suffix}`, { directory, revision: baseline })
+        this.store.put('orca-operation', renameId, { id: renameId, ...rename, done: true })
       }
-      await this.verifyWorkspace({ ...ticket, execution: { name, directory: existing, assignment: ticket.mandate.scope } })
-      const current = this.store.tickets.get(ticket.id)!
-      const branch = (await execute('git', ['-C', existing, 'symbolic-ref', '--short', 'HEAD'])).stdout.trim()
-      current.execution = { name: plan?.continueFrom ? branch : name, directory: existing, assignment: ticket.mandate.scope }
-      this.store.tickets.save(current)
-      return existing
+      const branch = (await execute('git', ['-C', directory, 'symbolic-ref', '--short', 'HEAD'])).stdout.trim()
+      const worktree = this.store.get<Operation>('orca-operation', `worktree:${projects.workspaceOwner(ticket.id)}${suffix}`)?.response?.result?.worktree
+      this.store.atomic(() => {
+        this.store.put('ticket-workspace', `${ticket.id}:${target.locationId}`, { ticketId: ticket.id, locationId: target.locationId, repository: target.repository, directory, name: branch, ...(worktree?.id ? { worktreeId: worktree.id } : {}) })
+        if (!index) {
+          const current = this.store.tickets.get(ticket.id)!
+          current.execution = { name: plan?.continueFrom ? branch : name, directory: directory!, assignment: current.execution?.assignment ?? ticket.mandate.scope }
+          this.store.tickets.save(current)
+        }
+      })
+      if (!index) primary = directory
     }
-    const id = `worktree:${ticket.id}`, marker = `osa ticket ${ticket.id}`
-    let operation = this.store.get<Operation>('orca-operation', id)
-    if (!operation) {
-      operation = { id, requestId: randomUUID(), args: ['worktree', 'create', '--repo', `path:${this.repository(ticket.id)}`, '--name', name, '--comment', marker, '--no-parent', ...(this.store.get<TicketTarget>('ticket-target', ticket.id)?.baseBranch ? ['--base-branch', this.store.get<TicketTarget>('ticket-target', ticket.id)!.baseBranch!] : [])] }
-      this.store.put('orca-operation', id, operation)
-    }
-    if (!operation.response && operation.attempted) {
-      const listing = await this.read(['worktree', 'list', '--repo', `path:${this.repository(ticket.id)}`])
-      const matches = listing.worktrees?.filter((item: Json) => item.comment === marker)
-      if (listing.truncated || matches?.length !== 1) throw new Error('Uncertain worktree creation; inspect before retrying')
-      operation.response = { ok: true, result: { worktree: matches[0] } }
-    }
-    if (!operation.response) {
-      operation.attempted = true
-      this.store.put('orca-operation', id, operation)
-      operation.response = await this.cli(operation.args)
-    }
-    this.store.put('orca-operation', id, operation)
-    const directory = text(this.result(operation.response).worktree?.path, 'worktree directory')
-    if (!isAbsolute(directory)) throw new Error('Orca returned a relative worktree directory')
-    await this.verifyWorkspace({ ...ticket, execution: { name, directory, assignment: ticket.mandate.scope } })
-    // Orca prefixes branch names with the account name; the ticket contract requires the exact short name.
-    const branch = (await execute('git', ['-C', directory, 'symbolic-ref', '--short', 'HEAD'])).stdout.trim()
-    const renameId = `branch:${ticket.id}`
-    let rename = this.store.get<{ branch: string; name: string; done?: boolean }>('orca-operation', renameId)
-    if (!rename) { rename = { branch, name }; this.store.put('orca-operation', renameId, { id: renameId, ...rename }) }
-    if (branch !== name) {
-      if (branch !== rename.branch || rename.done) throw new Error('Worktree branch changed externally; refusing rename')
-      await execute('git', ['-C', directory, 'branch', '-m', name])
-    }
-    const baseline = (await execute('git', ['-C', directory, 'rev-parse', 'HEAD'])).stdout.trim()
-    this.store.put('workspace-baseline', ticket.id, { directory, revision: baseline })
-    this.store.atomic(() => {
-      this.store.put('orca-operation', renameId, { id: renameId, ...rename, done: true })
-      const current = this.store.tickets.get(ticket.id)!
-      current.execution = { name, directory, assignment: current.execution?.assignment ?? ticket.mandate.scope }
-      this.store.tickets.save(current)
-    })
-    return directory
+    return primary
   }
 
   private async launch(job: Job, ticket: Ticket, engine: Engine): Promise<void> {
@@ -630,7 +639,7 @@ Release each settled child with worker-release before acknowledging its Orca del
       if (!this.canStart(current, job.assignmentId)) return
     }
     const receipt = await this.mutation(`launch:${binding.id}`, ['orchestration', 'worker-start', '--spec', this.prompt(ticket, binding.id), '--task-title', ticket.title,
-      '--worktree', `path:${directory}`, '--agent', 'codex', ...(this.options.model ? ['--model', this.options.model] : []), '--run', binding.runId, '--from', binding.anchor!], async () => {
+      '--worktree', `path:${directory}`, '--agent', this.options.agent ?? 'codex', ...(this.options.model ? ['--model', this.options.model] : []), '--run', binding.runId, '--from', binding.anchor!], async () => {
       const listing = await this.read(['orchestration', 'worker-list', '--run', binding!.runId!])
       if (listing.page?.hasMore || listing.workers?.length !== 1) throw new Error('Uncertain launch: no unique worker in assignment Run; refusing duplicate launch')
       const worker = listing.workers[0]

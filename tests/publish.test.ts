@@ -34,19 +34,18 @@ let r;
 if(path==='user') r={id:s.owner};
 else if(path==='repos/owner/test') r={full_name:'owner/test',default_branch:'main'};
 else if(path.includes('?')) r=s.pull?[s.pull]:[];
-else if(path==='repos/owner/test/pulls') { s.count++; s.pull={number:1,html_url:'https://github.com/owner/test/pull/1',state:'open',user:{id:42},head:{ref:'ticket-branch',repo:{full_name:'owner/test'}}}; r=s.pull; }
+else if(path==='repos/owner/test/pulls') { s.count++; s.pull={number:1,html_url:'https://github.com/owner/test/pull/1',state:'open',user:{id:42},head:{ref:'ticket-branch',sha:'${git('rev-parse','HEAD')}',repo:{full_name:'owner/test'}}}; r=s.pull; }
 else throw Error(path);
 fs.writeFileSync(file,JSON.stringify(s));
 if(s.drop && !path.includes('?') && path.endsWith('/pulls')) { s.drop=false; fs.writeFileSync(file,JSON.stringify(s)); process.exit(1); }
 console.log(JSON.stringify(r));
 `, { mode: 0o755 })
-  const reviews = { assertReady: vi.fn(async () => {}) }
-  const publisher = new Publisher(store, { repository: 'owner/test', owner: { id: '42', login: 'owner' } }, reviews, cli)
+  const publisher = new Publisher(store, { repository: 'owner/test', owner: { id: '42', login: 'owner' } }, cli)
   const publish = () => publisher.publish(app.engine, ticketId, assignment, 'Change', 'Checked change')
-  return { store, app, repo, git, remote, state, publisher, reviews, publish, ticketId, assignment }
+  return { store, app, repo, git, remote, state, publisher, publish, ticketId, assignment }
 }
 
-test('publishes reviewed commit once and binds PR before ready; response loss reconciles', async () => {
+test('publishes authorized clean commit once and binds PR before ready; response loss reconciles', async () => {
   const f = fixture()
   writeFileSync(f.state, JSON.stringify({ count: 0, owner: 42, pull: null, drop: true }))
   await expect(f.publish()).rejects.toThrow()
@@ -57,10 +56,9 @@ test('publishes reviewed commit once and binds PR before ready; response loss re
   expect(execFileSync('git', ['--git-dir', f.remote, 'rev-parse', 'ticket-branch'], { encoding: 'utf8' }).trim()).toBe(f.git('rev-parse', 'HEAD'))
 })
 
-test('refuses publishing without review or Router authorization', async () => {
+test('refuses publishing without owner authorization', async () => {
   const f = fixture()
-  f.reviews.assertReady.mockRejectedValueOnce(new Error('review required'))
-  await expect(f.publish()).rejects.toThrow('review required')
+  f.store.put('config', 'two-layer', true)
   f.store.delete('publish-authorization', f.ticketId)
   await expect(f.publish()).rejects.toThrow('not authorized')
   expect(JSON.parse(readFileSync(f.state, 'utf8')).count).toBe(0)
@@ -111,8 +109,81 @@ test('publishing rejects a foreign Git clone and unknown targets without side ef
 
 test('revoking target publishing authorization during verification prevents the push', async () => {
   const f = fixture()
-  f.reviews.assertReady.mockImplementationOnce(async () => { f.store.delete('publish-authorization', f.ticketId) })
+  vi.spyOn(f.publisher as any, 'api').mockImplementationOnce(async () => { f.store.delete('publish-authorization', f.ticketId); return {id: 42} })
   await expect(f.publish()).rejects.toThrow('not authorized')
   expect(() => execFileSync('git', ['--git-dir', f.remote, 'rev-parse', 'ticket-branch'], { stdio: 'pipe' })).toThrow()
   expect(JSON.parse(readFileSync(f.state, 'utf8')).count).toBe(0)
+})
+
+
+test('multi-repository publication uses each bound workspace and waits for both owned PRs to close', async () => {
+  const f=fixture(), secondRepo=join(f.repo,'..','second'), secondRemote=join(f.repo,'..','second-remote.git'), secondCli=join(f.repo,'..','second-gh')
+  execFileSync('git',['clone',f.repo,secondRepo],{stdio:'pipe'})
+  const git=(...args:string[])=>execFileSync('git',['-C',secondRepo,...args],{stdio:'pipe',encoding:'utf8'}).trim()
+  git('checkout','-b','second-branch'); git('init','--bare',secondRemote); git('config',`url.${secondRemote}.insteadOf`,'https://github.com/owner/second.git')
+  const github={repository:'owner/test',owner:{id:'42',login:'owner'}}, secondGithub={...github,repository:'owner/second'}
+  const primary={projectId:'p',componentId:'a',locationId:'a',repository:f.repo,kind:'git' as const,hostId:'local',github}
+  const secondary={...primary,componentId:'b',locationId:'b',repository:secondRepo,github:secondGithub}
+  f.store.put('ticket-target',f.ticketId,{...primary,ticketId:f.ticketId,repositories:[primary,secondary],boundAt:new Date().toISOString()})
+  for(const [target,name] of [[primary,'ticket-branch'],[secondary,'second-branch']] as const) f.store.put('ticket-workspace',`${f.ticketId}:${target.locationId}`,{ticketId:f.ticketId,locationId:target.locationId,repository:target.repository,directory:target.repository,name})
+  f.store.put('publish-authorization',f.ticketId,{...github,repositories:[github,secondGithub]})
+  writeFileSync(secondCli,`#!${process.execPath}
+const path=process.argv[5];
+console.log(JSON.stringify(path==='user'?{id:42}:path==='repos/owner/second'?{full_name:'owner/second',default_branch:'main'}:path.includes('?')?[]:{number:2,html_url:'https://github.com/owner/second/pull/2',state:'open',user:{id:42},head:{ref:'second-branch',sha:'${git('rev-parse','HEAD')}',repo:{full_name:'owner/second'}}}));
+`,{mode:0o755})
+  const secondPublisher=new Publisher(f.store,secondGithub,secondCli)
+  await expect(f.publish()).rejects.toThrow('Select --location')
+  await f.publisher.publish(f.app.engine,f.ticketId,f.assignment,'First','First checked','a')
+  await secondPublisher.publish(f.app.engine,f.ticketId,f.assignment,'Second','Second checked','b')
+  expect(f.store.list('publication')).toHaveLength(2)
+  expect(f.store.tickets.get(f.ticketId)?.follows).toHaveLength(2)
+  f.app.engine.report(f.ticketId,{state:'ready',summary:'Both repositories ready'})
+  f.app.engine.threadClosed({source:'github',id:'owner/test:1'},'merged',new Date().toISOString())
+  expect(f.store.tickets.get(f.ticketId)?.ended).toBeUndefined()
+  f.app.engine.threadClosed({source:'github',id:'owner/second:2'},'merged',new Date().toISOString())
+  expect(f.store.tickets.get(f.ticketId)?.ended?.outcome).toBe('merged')
+  expect(execFileSync('git',['--git-dir',secondRemote,'rev-parse','second-branch'],{encoding:'utf8'}).trim()).toBe(git('rev-parse','HEAD'))
+})
+
+
+test('a PR for a different commit is never recorded as this publication', async () => {
+  const f=fixture()
+  writeFileSync(f.state,JSON.stringify({count:0,owner:42,pull:{number:1,html_url:'https://github.com/owner/test/pull/1',state:'open',user:{id:42},head:{ref:'ticket-branch',sha:'0'.repeat(40),repo:{full_name:'owner/test'}}}}))
+  await expect(f.publish()).rejects.toThrow('does not belong')
+  expect(f.store.tickets.get(f.ticketId)?.follows).toBeUndefined()
+  expect(f.store.list<any>('publication')[0]).not.toHaveProperty('pr')
+})
+
+
+test.each([false,true])('ready requires the current published commit even when an older PR is closed: %s', async closed => {
+  const f=fixture()
+  await expect(f.publisher.assertPublished(f.ticketId,f.assignment)).rejects.toThrow('current commit')
+  await f.publish()
+  let assignment=f.assignment
+  await f.publisher.assertPublished(f.ticketId,assignment)
+  if(closed) {
+    f.app.engine.report(f.ticketId,{state:'ready',summary:'Original delivery ready'})
+    f.app.engine.threadClosed({source:'github',id:'owner/test:1'},'merged',new Date().toISOString())
+    expect(f.store.tickets.get(f.ticketId)?.ended?.outcome).toBe('merged')
+    f.app.engine.receive({id:'followup',source:'router',actor:{source:'router',id:'owner'},human:true,addressed:'direct',at:new Date().toISOString(),text:'Fix the remaining issue',threads:[{source:'router',id:'window'}],meta:{}})
+    assignment=f.store.tickets.get(f.ticketId)!.assignments.at(-1)!.id
+    f.app.engine.assignmentStarted(f.ticketId,assignment)
+    await f.publisher.assertPublished(f.ticketId,assignment)
+  }
+  writeFileSync(join(f.repo,'README.md'),'New authorized change\n')
+  await expect(f.publisher.assertPublished(f.ticketId,assignment)).rejects.toThrow('Commit and publish')
+  f.git('add','README.md'); f.git('commit','-m','followup')
+  await expect(f.publisher.assertPublished(f.ticketId,assignment)).rejects.toThrow('current commit')
+})
+
+test('status exposes publication identity and reconstructs only known legacy publication keys', async () => {
+  const f=fixture(); await f.publish()
+  const status=()=>f.app.handle({command:['owner','status'],options:{},id:'read'}) as any
+  const sha=f.git('rev-parse','HEAD'), id=`${f.ticketId}:${sha}`
+  expect(status().publications).toEqual([expect.objectContaining({ticketId:f.ticketId,repository:'owner/test',sha,pr:1,url:'https://github.com/owner/test/pull/1'})])
+  const {ticketId:_ticket,repository:_repository,locationId:_location,...legacy}=f.store.get<any>('publication',id)
+  f.store.put('publication',id,legacy)
+  f.store.put('publication',`unknown-ticket:${sha}`,{...legacy,title:'Unrelated legacy record'})
+  f.store.put('publication','other-modern',{...legacy,ticketId:'unknown-ticket',repository:'owner/unrelated'})
+  expect(status().publications).toEqual([expect.objectContaining({ticketId:f.ticketId,repository:'owner/test',title:'Change',sha,pr:1})])
 })

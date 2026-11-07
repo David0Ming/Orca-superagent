@@ -1,5 +1,5 @@
 import { spawn, execFileSync } from 'node:child_process'
-import { mkdirSync, chmodSync, readFileSync, writeFileSync, renameSync, openSync, closeSync } from 'node:fs'
+import { mkdirSync, chmodSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, existsSync, rmSync } from 'node:fs'
 import { resolve, join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
@@ -8,12 +8,15 @@ import { setTimeout as sleep } from 'node:timers/promises'
 
 const script = fileURLToPath(import.meta.url)
 const args = process.argv.slice(2), command = args.shift()
+const supervised = args.includes('--supervised')
+if (supervised) args.splice(args.indexOf('--supervised'), 1)
 const index = args.indexOf('--state')
 if (index >= 0 && (!args[index + 1] || args[index + 1].startsWith('--'))) throw new Error('--state requires a path')
 const state = resolve(index < 0 ? '.osa' : args[index + 1])
 if (index >= 0) args.splice(index, 2)
 mkdirSync(state, { recursive: true, mode: 0o700 }); chmodSync(state, 0o700)
 const recordPath = join(state, 'service.json'), log = join(state, 'service.log')
+const manualStop = join(state, 'manual-stop')
 const read = () => { try { return JSON.parse(readFileSync(recordPath, 'utf8')) } catch (error) { if (error.code === 'ENOENT') return undefined; throw error } }
 const identity = pid => {
   if (!Number.isSafeInteger(pid) || pid <= 1) return undefined
@@ -75,11 +78,12 @@ try {
   else if (command === 'status') {
     const record = read()
     const running = live(record), orphaned = !running && childLive(record)
-    console.log(JSON.stringify({ ...record, state, log, running: running || orphaned, status: running ? record.status : orphaned ? 'orphaned' : record?.status === 'failed' ? 'failed' : 'stopped' }))
+    console.log(JSON.stringify({ ...record, state, log, manualStopped: existsSync(manualStop), running: running || orphaned, status: running ? record.status : orphaned ? 'orphaned' : record?.status === 'failed' ? 'failed' : 'stopped' }))
   } else if (command === 'start') {
     const previous = read()
     if (live(previous)) throw new Error('Service launcher already running')
     if (childLive(previous)) throw new Error('Service child is still running; use stop before restarting')
+    if (!supervised) rmSync(manualStop, { force: true })
     const nonce = randomUUID(), fd = openSync(log, 'a', 0o600)
     const child = spawn(process.execPath, [script, '_run', nonce, '--state', state, ...args], { detached: true, stdio: ['ignore', fd, fd] })
     closeSync(fd)
@@ -98,6 +102,7 @@ try {
       await sleep(50)
     }
   } else if (command === 'stop') {
+    if (!supervised) writeFileSync(manualStop, new Date().toISOString() + '\n', { mode: 0o600 })
     const record = read()
     if (live(record)) {
       // Never signal a stale/reused PID; the full start time and command must still match.

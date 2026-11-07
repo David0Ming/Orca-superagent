@@ -1,24 +1,24 @@
 import { createServer, connect } from 'node:net'
-import { mkdirSync, chmodSync, existsSync, unlinkSync, realpathSync } from 'node:fs'
+import { mkdirSync, chmodSync, existsSync, unlinkSync, realpathSync, readdirSync, readFileSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, promisify } from 'node:util'
 import { execFile } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Store } from '../src/store.ts'
 import { App, type Request, type GitHubConfig } from '../src/app.ts'
 import { OrcaExecutor } from '../src/orca.ts'
 import { GitHub } from '../src/github.ts'
-import { ReviewGate } from '../src/review.ts'
 import { Publisher } from '../src/publish.ts'
 import { Feishu } from '../src/feishu.ts'
-import { Projects, type TicketTarget } from '../src/projects.ts'
+import { Projects } from '../src/projects.ts'
 import { WorkspaceCleanup } from '../src/cleanup.ts'
 import { RouterWake } from '../src/router.ts'
 import { collectWatchdog } from '../src/watchdog.ts'
+import { Windows } from '../src/windows.ts'
 
-const names = ['workspace', 'continue-from', 'fingerprint', 'purpose', 'asked-by', 'answers', 'state', 'repository', 'cli', 'lease', 'ticket', 'assignment', 'token', 'inputs', 'message', 'summary', 'question', 'trigger', 'reason', 'thread', 'id', 'text', 'title', 'scope', 'name', 'note', 'timeout', 'github', 'gh-cli', 'two-layer', 'dispatch', 'publish', 'body', 'feishu-chat', 'lark-cli', 'stall-ms', 'executor-model']
+const names = ['workspace', 'continue-from', 'fingerprint', 'purpose', 'asked-by', 'answers', 'state', 'repository', 'cli', 'lease', 'ticket', 'assignment', 'token', 'inputs', 'message', 'summary', 'question', 'trigger', 'reason', 'thread', 'id', 'text', 'title', 'scope', 'name', 'note', 'timeout', 'github', 'gh-cli', 'two-layer', 'dispatch', 'publish', 'body', 'feishu-chat', 'lark-cli', 'stall-ms', 'executor-model', 'executor-agent', 'locations', 'search']
 names.push('project', 'projects', 'component', 'location', 'host', 'kind', 'repo-id', 'base-branch', 'github-repository', 'github-owner-id', 'github-owner-login', 'priority', 'depends-on', 'resources', 'goal', 'source', 'version', 'terminal', 'max-executors', 'acceptance-ticket', 'next-step', 'evidence', 'session', 'watchdog-events', 'report-to')
 const parsed = parseArgs({ options: Object.fromEntries(names.map(name => [name, { type: 'string' as const }])), allowPositionals: true })
 const options = parsed.values as Record<string, string>
@@ -29,8 +29,9 @@ const quote = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'"
 function rpc(request: Request): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath)
+    socket.setEncoding('utf8')
     let data = ''
-    socket.setTimeout(['review', 'pr', 'cleanup'].includes(request.command[0]) || ['route retry', 'report ready'].includes(request.command.join(' ')) ? 180_000 : 15_000, () => socket.destroy(new Error('Service response timed out')))
+    socket.setTimeout(['pr', 'cleanup'].includes(request.command[0]) || ['route retry', 'owner retry', 'report ready', 'owner windows', 'owner window-link', 'owner window-observe', 'owner window-open'].includes(request.command.join(' ')) ? 180_000 : 15_000, () => socket.destroy(new Error('Service response timed out')))
     socket.on('connect', () => socket.write(JSON.stringify(request) + '\n'))
     socket.on('error', reject)
     socket.on('data', chunk => { data += chunk; if (data.includes('\n')) {
@@ -69,19 +70,23 @@ async function serve() {
   })
   let app: App
   let executor: OrcaExecutor
-  let review: ReviewGate | undefined, wake: RouterWake, cleanup: WorkspaceCleanup
+  let wake: RouterWake, cleanup: WorkspaceCleanup, windows: Windows
   const publishers = new Map<string, Publisher>()
   const report = async (request: Request) => {
-    if (!app.store.get('report-receipt', request.id) && review && request.command[1] === 'ready') {
-      const ticket = app.executorTicket(request.options), assignment = request.options.assignment
-      const unchanged = review.guard(ticket.id, assignment)
-      await review.assertReady(ticket.id, assignment)
-      unchanged()
-      if (app.store.get('publish-authorization', ticket.id) && !ticket.follows?.some(follow => follow.thread.startsWith('github:') && follow.own && !follow.closed)) throw new Error('Publish the reviewed PR before reporting ready')
+    if (!app.store.get('report-receipt', request.id) && request.command[1] === 'ready') {
+      const ticket = app.executorTicket(request.options)
+      const authorization = app.store.get<GitHubConfig & {repositories?: GitHubConfig[]}>('publish-authorization', ticket.id)
+      for (const target of authorization?.repositories ?? (authorization ? [authorization] : [])) {
+        const publisher = publishers.get(target.repository)
+        if (!publisher) throw new Error(`Publishing is not configured for ${target.repository}`)
+        const location = app.projects.targets(ticket.id).find(location => location.github?.repository === target.repository)
+        await publisher.assertPublished(ticket.id, request.options.assignment, location?.locationId)
+      }
     }
     return app.acceptReport(request)
   }
   const server = createServer(socket => {
+    socket.setEncoding('utf8')
     let data = ''
     socket.setTimeout(5000, () => socket.destroy())
     socket.on('error', () => {})
@@ -94,7 +99,12 @@ async function serve() {
       try {
         const request: Request = JSON.parse(data)
         let result: unknown
-        if (request.command?.[0] === 'cleanup') {
+        if (request.command?.[0] === 'owner' && ['windows', 'window-link', 'window-observe', 'window-open'].includes(request.command[1])) {
+          if (request.command[1] === 'windows') result = await windows.list(request.options)
+          else if (request.command[1] === 'window-link') result = await windows.link(request.options)
+          else if (request.command[1] === 'window-observe') result = await windows.observe(request.options)
+          else result = await windows.open(request.options)
+        } else if (request.command?.[0] === 'cleanup') {
           app.authorizeRouter(request.options)
           if (request.command[1] === 'inspect') result = await cleanup.inspect(request.options.ticket)
           else if (request.command[1] === 'references') result = await cleanup.references(request.options.ticket, request.options.fingerprint, request.options.evidence, () => app.authorizeRouter(request.options))
@@ -111,27 +121,22 @@ async function serve() {
           app.authorizeRouter(request.options)
           result = app.projects.importOrca(results[0].repos, results[1].projects, results[2])
         } else if (request.command?.[0] === 'router' && ['bind', 'unbind', 'status'].includes(request.command[1])) {
-          app.authorizeRouter(request.options)
+          if (request.command[1] !== 'status') app.authorizeRouter(request.options)
           if (request.command[1] === 'bind') result = await wake.bind(request.options.terminal, () => app.authorizeRouter(request.options), request.options.session)
           else if (request.command[1] === 'unbind') result = wake.unbind()
           else result = wake.status()
-        } else if (request.command?.join(' ') === 'route retry') {
+        } else if (['route retry', 'owner retry'].includes(request.command?.join(' '))) {
           const validated = app.handle(request) as { ticketId: string }
           result = await executor.retryTicket(app.engine, validated.ticketId)
         } else if (request.command?.[0] === 'report') result = await report(request)
-        else if (['review', 'pr'].includes(request.command?.[0])) {
+        else if (request.command?.[0] === 'pr') {
           const ticket = app.executorTicket(request.options), assignment = request.options.assignment
-          if (request.command[0] === 'review') {
-            if (!review) throw new Error('Two-layer execution is not enabled')
-            if (request.command[1] === 'snapshot') result = await review.snapshot(ticket.id, assignment)
-            else if (request.command[1] === 'record' && request.options.dispatch) result = await review.record(ticket.id, assignment, request.options.dispatch)
-            else throw new Error('Use review snapshot or review record --dispatch ID')
-          } else if (request.command[0] === 'pr') {
-            const target = app.store.get<TicketTarget>('ticket-target', ticket.id)
-            const publisher = publishers.get(target?.github?.repository ?? app.github?.repository ?? '')
-            if (!publisher || request.command[1] !== 'publish') throw new Error('GitHub publishing is not enabled')
-            result = await publisher.publish(app.engine, ticket.id, assignment, request.options.title ?? '', request.options.body ?? '')
-          }
+          const targets = app.projects.targets(ticket.id)
+          const selected = request.options.location ? targets.find(target => target.locationId === request.options.location) : targets.length === 1 ? targets[0] : undefined
+          if (targets.length > 1 && !selected) throw new Error('Select --location for publishing a multi-repository task')
+          const publisher = publishers.get(selected?.github?.repository ?? (!targets.length ? app.github?.repository ?? '' : ''))
+          if (!publisher || request.command[1] !== 'publish') throw new Error('GitHub publishing is not enabled for this target')
+          result = await publisher.publish(app.engine, ticket.id, assignment, request.options.title ?? '', request.options.body ?? '', request.options.location)
         } else result = app.handle(request)
         socket.end(JSON.stringify({ ok: true, result: result ?? null }) + '\n')
       }
@@ -141,15 +146,18 @@ async function serve() {
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve) })
   chmodSync(socketPath, 0o600)
   const store = new Store(join(state, 'state.db'))
+  const codePath = fileURLToPath(new URL('..', import.meta.url)), code = createHash('sha256')
+  for (const folder of ['src', 'bin']) for (const file of readdirSync(join(codePath, folder)).filter(file => file.endsWith('.ts')).sort())
+    code.update(`${folder}/${file}\0`).update(readFileSync(join(codePath, folder, file)))
+  store.put('config', 'runtime', { codeVersion: code.digest('hex'), codePath, loadedAt: new Date().toISOString(), nodeVersion: process.version })
   const repository = realpathSync(resolve(options.repository ?? process.cwd()))
   const previous = store.get<string>('config', 'repository')
   if (previous && realpathSync(previous) !== repository) throw new Error('State directory belongs to a different repository')
   store.put('config', 'repository', repository)
   const cli = options.cli ?? process.env.ORCA_CLI_COMMAND ?? 'orca'
   if (options['two-layer'] && !['true', 'false'].includes(options['two-layer'])) throw new Error('--two-layer must be true or false')
-  const twoLayer = !!options.github || !!options['feishu-chat'] || options['two-layer'] === 'true'
-  if (store.get('config', 'two-layer') === true && !twoLayer) throw new Error('Cannot disable review for an existing two-layer state directory')
-  store.put('config', 'two-layer', twoLayer)
+  // Legacy state and --two-layer remain readable; review instructions belong to the task and repository.
+  store.put('config', 'two-layer', false)
   const repositories = [...new Set((options.github ?? '').split(',').map(name => name.trim()).filter(Boolean))]
   if (repositories.some(name => !/^[\w.-]+\/[\w.-]+$/.test(name))) throw new Error('Invalid GitHub owner/repository')
   const githubOwner = repositories.length ? await GitHub.discover(options['gh-cli']) : undefined
@@ -165,9 +173,9 @@ async function serve() {
   if (savedFeishu && JSON.stringify(savedFeishu) !== JSON.stringify(feishuConfig)) throw new Error('Feishu chat or identity changed for this state directory')
   const feishu = feishuConfig ? new Feishu(store, { ...feishuConfig, cli: options['lark-cli'] }) : undefined
   if (feishuConfig) store.put('config', 'feishu', feishuConfig)
-  review = twoLayer ? new ReviewGate(store, { cli, repository }) : undefined
-  for (const config of githubConfigs) publishers.set(config.repository, new Publisher(store, config, review!, options['gh-cli']))
+  for (const config of githubConfigs) publishers.set(config.repository, new Publisher(store, config, options['gh-cli']))
   cleanup = new WorkspaceCleanup(store, cli)
+  windows = new Windows(store, cli)
   const projects = new Projects(store)
   if (!store.get('config', 'legacy-target') && store.tickets.list().length) {
     // SQLite snapshot includes the WAL; never copy a live database file alone.
@@ -179,8 +187,10 @@ async function serve() {
   const stallMs = options['stall-ms'] === undefined ? undefined : Number(options['stall-ms'])
   if (stallMs !== undefined && (!Number.isSafeInteger(stallMs) || stallMs < 1000)) throw new Error('--stall-ms must be an integer >= 1000')
   if (options['executor-model'] && !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/.test(options['executor-model'])) throw new Error('Invalid executor model ID')
+  if (options['executor-agent'] && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(options['executor-agent'])) throw new Error('Invalid executor agent')
+  store.put('config', 'executor', { agent: options['executor-agent'] ?? 'codex', ...(options['executor-model'] ? {model: options['executor-model']} : {}) })
   const osaCommand = [process.execPath, '--experimental-transform-types', fileURLToPath(import.meta.url), '--state', state].map(quote).join(' ')
-  executor = new OrcaExecutor(store, { repository, cli, twoLayer, stallMs, maxExecutors, model: options['executor-model'], osaCommand, report })
+  executor = new OrcaExecutor(store, { repository, cli, agent: options['executor-agent'], stallMs, maxExecutors, model: options['executor-model'], osaCommand, report })
   app = new App(store, executor, undefined, githubConfig, feishuConfig, projects, githubConfigs)
   wake = new RouterWake(store, { cli, repository, osaCommand })
   let waking: Promise<void> | undefined

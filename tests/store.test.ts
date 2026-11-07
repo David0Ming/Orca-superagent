@@ -175,4 +175,18 @@ describe('Store', () => {
     store.threads.get(row.key)!.pending.push('also unsaved')
     expect(store.threads.list()[0]!.pending).toEqual([])
   })
+
+  it('keeps routine progress quiet and flags unread inputs only after execution settled', () => {
+    const row = ticket('work', { assignments: [{id:'worker',state:'running',createdAt:at,report:{state:'progress',summary:'Reading files',at}}],
+      inputs:[{id:'followup',kind:'trigger',triggerId:'question',human:true,at}], undelivered:['followup'] })
+    store.tickets.save(row)
+    expect(store.routerNotices()).toEqual([])
+    row.assignments[0].report = {state:'waiting',summary:'Waiting for child work',at}
+    store.tickets.save(row)
+    expect(store.routerNotices()).toEqual([])
+    store.put('orca-assignment', 'worker', {settled:'done'})
+    expect(store.routerNotices()).toEqual([expect.objectContaining({kind:'inputs',inputIds:['followup']})])
+    store.put('input-resolution', 'followup', {summary:'Handled'})
+    expect(store.routerNotices()).toEqual([])
+  })
 })

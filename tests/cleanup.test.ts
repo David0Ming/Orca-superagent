@@ -127,3 +127,11 @@ test('ended continuations inherit cleanup ownership without historical dependenc
   expect(await f.gate.remove('next',(await f.gate.inspect('next')).fingerprint,()=>{})).toMatchObject({state:'removed'})
   expect(existsSync(f.work)).toBe(false)
 })
+
+test('cleanup preserves a workspace used as another active task secondary repository', async () => {
+  const f = await fixture(), other = {...f.store.tickets.get('t')!, id:'multi', ended:undefined, execution:{name:'multi',directory:f.repo,assignment:'Task'}}
+  f.store.tickets.save(other)
+  f.store.put('ticket-workspace', 'multi:second', {ticketId:'multi',locationId:'second',repository:f.repo,directory:f.work,name:'task'})
+  expect((await f.gate.inspect('t')).reasons.join(' ')).toContain('Another ticket references')
+  expect(existsSync(f.work)).toBe(true)
+})

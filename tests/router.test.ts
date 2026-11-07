@@ -6,7 +6,7 @@ import { RouterWake } from '../src/router.ts'
 import { Store } from '../src/store.ts'
 
 const cleanups: (() => void)[] = []
-afterEach(() => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0)) cleanup() })
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const cleanup of cleanups.splice(0)) cleanup() })
 function fixture() {
   let now = Date.now()
   vi.spyOn(Date,'now').mockImplementation(()=>now)
@@ -18,6 +18,7 @@ function fixture() {
   writeFileSync(cli, `#!${process.execPath}
 const fs=require('node:fs'), path=${JSON.stringify(path)};
 const s=JSON.parse(fs.readFileSync(path)), args=process.argv.slice(2); s.calls.push(args);
+if(s.rejectInherited && process.env.ORCA_AGENT_SESSION_ID && args.includes('--from')) {console.log(JSON.stringify({ok:false,error:{code:'consumer_fenced',message:'Inherited agent cannot act as the Router anchor'}}));process.exit(1)}
 let result;
 if(args[0]==='terminal' && args[1]==='show') result={terminal:s.terminal};
 else if(args[1]==='request-show') result=s.receipt?{state:'completed',receipt:s.receipt}:{state:s.pending?'pending':'absent'};
@@ -57,6 +58,16 @@ test('explicit exact binding; native attention deduplicates pending work without
   f.wake.unbind()
   await f.wake.tick()
   expect(f.state().sends).toBe(2)
+})
+
+test('service wake uses its anchor rather than inheriting the launching agent identity', async () => {
+  vi.stubEnv('ORCA_AGENT_SESSION_ID', 'launching-agent')
+  const f = fixture(); f.update({...f.state(), rejectInherited:true})
+  await f.bind(); f.store.put('candidate','request',{evalId:'request'})
+  await f.wake.tick()
+  expect(f.state().sends).toBe(1)
+  expect(f.store.get<any>('router','health').state).toBe('connected')
+  expect(f.store.get('notice','router-wake')).toBeUndefined()
 })
 
 test('lost receipt reconciles after restart without duplicate send', async () => {

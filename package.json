@@ -7,7 +7,7 @@
   },
   "scripts": {
     "osa": "node --experimental-transform-types bin/osa.ts",
-    "test": "vitest run --exclude '**/.osa/**'",
+    "test": "vitest run --exclude '**/.osa/**' --exclude 'plugin/**'",
     "typecheck": "tsc --noEmit",
     "router:takeover": "node --experimental-transform-types bin/osa-router-takeover.ts"
   },

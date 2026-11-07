@@ -91,16 +91,17 @@ output(args.includes('--paginate') && args.includes('--slurp') ? pages : pages[0
   }
 }
 
-test('activation admits first-tick new issues across every page, rejects other authors, and deduplicates after restart', async () => {
+test('activation admits first-tick new issues across every page, preserves actual authors for policy, and deduplicates after restart', async () => {
   const f = setup()
   f.routes({ issues: [[issue(1, { created_at: '2020-01-01T00:00:00Z' }), issue(2, { user: { ...user, id: 99 } }),
     issue(3, { user: { ...user, type: 'Bot' } }), issue(4, { user: null })], [issue(5), issue(6, { user: { ...user, login: 'renamed-owner' } })]] })
   await f.tick()
-  expect(f.triggers().map(item => item.meta.number)).toEqual([5, 6])
-  expect(f.triggers()[0].channel).toEqual({ source: 'github', thread: `${repository}:5`, address: { repository, number: '5' } })
+  expect(f.triggers().map(item => item.meta.number)).toEqual([2, 3, 5, 6])
+  for (const trigger of f.triggers().slice(0, 2)) expect(() => f.engine.decide(trigger.id, {kind:'accept', title:'Unauthorized', scope:'Unauthorized', reason:'No'})).toThrow()
+  expect(f.triggers()[2].channel).toEqual({ source: 'github', thread: `${repository}:5`, address: { repository, number: '5' } })
   await f.tick()
   f.restart(); await f.tick()
-  expect(f.triggers()).toHaveLength(2)
+  expect(f.triggers()).toHaveLength(4)
   expect(f.calls().every(args => args.includes('github.com'))).toBe(true)
 })
 
@@ -159,12 +160,12 @@ test('conversation, inline comments and reviews use owner IDs, all pages, and co
     'pulls/7/reviews': [[{ id: 4, user, body: 'Looks good', state: 'APPROVED', submitted_at: fresh }],
       [{ id: 5, user, body: '', state: 'CHANGES_REQUESTED', submitted_at: fresh }, { id: 6, user, body: 'draft', state: 'PENDING' }]] })
   await f.tick()
-  expect(f.triggers().map(item => item.meta.kind)).toEqual(['comment', 'review-comment', 'review', 'review'])
-  expect(f.triggers()[1].text).toContain('file.ts:9')
+  expect(f.triggers().map(item => item.meta.kind)).toEqual(['comment', 'comment', 'review-comment', 'review', 'review'])
+  expect(f.triggers()[2].text).toContain('file.ts:9')
   expect(f.calls().some(args => args[3].includes('/commits/'))).toBe(false)
   f.routes({ 'pulls/7/reviews': [[{ id: 4, user, body: 'Edited review', state: 'APPROVED', submitted_at: fresh }]] })
   await f.tick()
-  expect(f.triggers()).toHaveLength(5)
+  expect(f.triggers()).toHaveLength(6)
   expect(f.triggers().at(-1)?.text).toContain('Edited review')
 })
 
@@ -340,4 +341,88 @@ test('regression: failing PR must not block unrelated new owner issue', async ()
   f.routes({ issues: [[issue(1)]], pulls: [[pull(2)]] }); f.update({ fail: 'pulls/2' })
   await expect(f.tick()).rejects.toThrow()
   expect(f.triggers().some(item => item.meta.number === 1)).toBe(true)
+})
+
+
+test('subscribed other humans and bots reach the same task with actual identities and cannot authorize new work', async () => {
+  const f=setup(); f.routes({issues:[[issue(1)]]}); await f.tick()
+  const ticketId=f.accept(), pr=pull(7)
+  f.update({pulls:{7:pr}})
+  f.routes({pulls:[[pr]],'issues/comments':[[comment(20,7,{user:{id:99,login:'reviewer',type:'User'},body:'Fix the existing bug'}),comment(21,7,{user:{id:100,login:'ci[bot]',type:'Bot'},body:'Tests failed'})]]})
+  await f.tick()
+  const feedback=f.triggers().filter(trigger=>[20,21].includes(Number(trigger.meta.nativeId)))
+  expect(feedback.map(trigger=>[trigger.actor.id,trigger.human])).toEqual([['99',true],['100',false]])
+  for(const trigger of feedback) {
+    expect(f.store.triggers.disposition(trigger.id)?.fanout).toEqual([ticketId])
+    expect(() => f.engine.decide(trigger.id,{kind:'accept',title:'Unauthorized',scope:'New work',reason:'No'})).toThrow()
+  }
+  expect(f.store.tickets.get(ticketId)?.inputs.filter(input=>input.kind==='trigger'&&feedback.some(trigger=>trigger.id===input.triggerId))).toHaveLength(2)
+  expect(f.store.tickets.list()).toHaveLength(1)
+})
+
+
+test('first repository merge waits for the second authorized PR binding and closure survives restart', async () => {
+  const f=setup(); f.routes({issues:[[issue(1)]]}); await f.tick()
+  const ticketId=f.accept(), primary={projectId:'p',componentId:'a',locationId:'a',repository:'/first',hostId:'local',kind:'git',github:{repository,owner}}
+  const secondary={...primary,componentId:'b',locationId:'b',repository:'/second',github:{repository:'owner/second',owner}}
+  f.store.put('ticket-target',ticketId,{...primary,ticketId,repositories:[primary,secondary]})
+  f.store.put('publish-authorization',ticketId,{repository,owner,repositories:[{repository,owner},{repository:'owner/second',owner}]})
+  const first=pull(7), closedFirst={...first,state:'closed',merged_at:'2026-11-02T00:10:00Z',closed_at:'2026-11-02T00:10:00Z'}
+  f.update({pulls:{7:first}}); f.routes({issues:[[]],pulls:[[first]]}); await f.tick()
+  f.engine.report(ticketId,{state:'progress',summary:'First PR published; still implementing second repository'})
+  f.update({pulls:{7:closedFirst}}); f.routes({pulls:[[]]}); await f.tick()
+  expect(f.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  expect(f.store.threads.get(`github:${repository}:7`)?.meta.prState).toEqual({state:'closed',outcome:'merged',at:'2026-11-02T00:10:00.000Z'})
+  f.restart(); await f.tick(); expect(f.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  const second=pull(8,{head:{ref:'fix-widget',sha:'b'.repeat(40),repo:{full_name:'owner/second'}}})
+  f.update({pulls:{7:closedFirst,8:second}}); f.routes({pulls:[[second]]})
+  const secondSource=new GitHub(f.store,{...f.options,repository:'owner/second'})
+  await secondSource.tick(f.engine)
+  expect(f.store.tickets.get(ticketId)?.follows).toHaveLength(2)
+  await f.tick()
+  expect(f.store.tickets.get(ticketId)?.follows?.find(follow=>follow.thread===`github:${repository}:7`)?.closed).toBeUndefined()
+  expect(f.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  f.engine.report(ticketId,{state:'ready',summary:'Both repositories ready'})
+  await f.tick()
+  expect(f.store.tickets.get(ticketId)?.follows?.find(follow=>follow.thread===`github:${repository}:7`)?.closed?.outcome).toBe('merged')
+  f.update({pulls:{7:closedFirst,8:{...second,state:'closed',merged_at:'2026-11-02T00:20:00Z',closed_at:'2026-11-02T00:20:00Z'}}}); f.routes({pulls:[[]]})
+  await secondSource.tick(f.engine)
+  expect(f.store.tickets.get(ticketId)?.ended?.outcome).toBe('merged')
+})
+
+
+test('a resumed multi-repository round cannot count the previous round PRs as current completion', async () => {
+  const f=setup(); f.routes({issues:[[issue(1)]]}); await f.tick()
+  const ticketId=f.accept(), primary={projectId:'p',componentId:'a',locationId:'a',repository:'/first',hostId:'local',kind:'git',github:{repository,owner}}
+  const secondary={...primary,componentId:'b',locationId:'b',repository:'/second',github:{repository:'owner/second',owner}}
+  f.store.put('ticket-target',ticketId,{...primary,ticketId,repositories:[primary,secondary]})
+  f.store.put('publish-authorization',ticketId,{repository,owner,repositories:[{repository,owner},{repository:'owner/second',owner}]})
+  f.engine.bindThread(ticketId,{source:'github',id:`${repository}:1`},true)
+  f.engine.bindThread(ticketId,{source:'github',id:'owner/second:1'},true)
+  f.engine.report(ticketId,{state:'ready',summary:'Original two repositories delivered'})
+  f.engine.threadClosed({source:'github',id:`${repository}:1`},'merged','2026-11-02T00:00:02Z')
+  f.engine.threadClosed({source:'github',id:'owner/second:1'},'merged','2026-11-02T00:00:03Z')
+  expect(f.store.tickets.get(ticketId)?.ended?.outcome).toBe('merged')
+  f.engine.receive({id:'second-round',source:'github',actor:{source:'github',id:owner.id},human:true,addressed:'direct',at:'2026-11-02T00:00:04Z',text:'Fix the remaining behavior in both repositories',threads:[{source:'github',id:`${repository}:1`}],meta:{repository}})
+  const assignment=f.store.tickets.get(ticketId)!.assignments.at(-1)!
+  f.engine.assignmentStarted(ticketId,assignment.id)
+  f.engine.report(ticketId,{state:'progress',summary:'A2 published; still implementing B2'})
+  const previousA=pull(1,{state:'closed',merged_at:'2026-11-02T00:00:02Z',closed_at:'2026-11-02T00:00:02Z'})
+  const nextA=pull(7), closedA={...nextA,state:'closed',merged_at:'2026-11-02T00:10:00Z',closed_at:'2026-11-02T00:10:00Z'}
+  f.update({pulls:{1:previousA,7:nextA}}); f.routes({issues:[[]],pulls:[[nextA]]}); await f.tick()
+  f.update({pulls:{1:previousA,7:closedA}}); f.routes({pulls:[[]]}); await f.tick()
+  expect(f.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  expect(f.store.tickets.get(ticketId)?.assignments.at(-1)?.report?.summary).toBe('A2 published; still implementing B2')
+  expect(f.store.threads.get(`github:${repository}:7`)?.meta.prState).toMatchObject({state:'closed',outcome:'merged'})
+  f.restart(); await f.tick(); expect(f.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  const nextB=pull(8,{head:{ref:'fix-widget',sha:'b'.repeat(40),repo:{full_name:'owner/second'}}})
+  f.update({pulls:{1:previousA,7:closedA,8:nextB}}); f.routes({pulls:[[nextB]]})
+  const secondSource=new GitHub(f.store,{...f.options,repository:'owner/second'})
+  await secondSource.tick(f.engine)
+  await f.tick(); expect(f.store.tickets.get(ticketId)?.ended).toBeUndefined()
+  f.engine.report(ticketId,{state:'ready',summary:'A2 and B2 are both delivered'})
+  await f.tick()
+  f.update({pulls:{1:previousA,7:closedA,8:{...nextB,state:'closed',merged_at:'2026-11-02T00:20:00Z',closed_at:'2026-11-02T00:20:00Z'}}}); f.routes({pulls:[[]]})
+  await secondSource.tick(f.engine)
+  expect(f.store.tickets.get(ticketId)?.ended?.outcome).toBe('merged')
 })
