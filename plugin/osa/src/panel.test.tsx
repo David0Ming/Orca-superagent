@@ -197,3 +197,74 @@ test('switching state directories blocks stale actions and keeps each draft sepa
     assert.deepEqual(view.errors, [])
   } finally { await view.unmount() }
 })
+
+test('conversation follows recorded times and retains legacy replies without duplicating reports', async () => {
+  const time = (minute: number) => `2026-11-07T07:0${minute}:00.000Z`
+  const first = { id: 'one', source: 'panel', actor: { source: 'panel', id: '501' }, human: true, at: time(1), text: '用户原始要求' }
+  const answer = { id: 'two', source: 'panel', actor: { source: 'panel', id: '501' }, human: true, at: time(4), text: '用户的回答' }
+  const progress = { state: 'progress', at: time(2), summary: '执行进展原文' }
+  const final = { state: 'ready', at: time(5), summary: '最终结果原文' }
+  const ticket = { id: 't', title: '对话测试', assignments: [{ id: 'a', state: 'ended', report: final }], inputs: [{ id: 'i', kind: 'trigger', triggerId: 'two', readAt: time(4) }], origin: { triggerIds: ['one'] }, undelivered: [], mandate: { scope: '工作' } }
+  const status = { stateDir: '/state', tickets: [ticket], projects: { projects: [{ id: 'p', name: '对话项目' }], components: [], locations: [], tasks: [{ ticket, context: { target: { projectId: 'p' } } }] }, triggers: [answer, first], reportReceipts: [{ ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: final }] } }, { ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: progress }] } }, { ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: { ...progress, summary: '同毫秒的另一进展' } }] } }, { ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: final }] } }], outbox: [{ ticketId: 't', text: '最终结果原文', status: 'sent', createdAt: time(5), channel: { source: 'panel' } }, { ticketId: 't', text: '需要回答的问题', status: 'sent', createdAt: time(3), channel: { source: 'panel' } }, { ticketId: 't', text: '旧的无时间回复', status: 'sent', channel: { source: 'github' } }] }
+  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
+  try {
+    await view.press({ text: '对话项目' })
+    await view.activateRow({ label: '项目任务' }, 't')
+    const tree: any = view.tree()
+    const detail = tree.children.find((child: any) => child?.children?.some((node: any) => node?.type === 'Heading' && node.children?.includes('对话')))
+    const nodes = detail.children
+    const conversation = JSON.stringify(nodes.slice(nodes.findIndex((n: any) => n?.type === 'Heading' && n.children?.includes('对话')), nodes.findIndex((n: any) => n?.type === 'Textarea')))
+    const words = ['用户原始要求', '执行进展原文', '同毫秒的另一进展', '需要回答的问题', '用户的回答', '最终结果原文', '旧的无时间回复']
+    assert.deepEqual(words.map(word => conversation.indexOf(word)).slice().sort((a, b) => a - b), words.map(word => conversation.indexOf(word)))
+    assert.ok(words.every(word => conversation.includes(word)))
+    assert.equal(conversation.split('最终结果原文').length - 1, 1)
+    assert.match(conversation, /时间未记录/)
+    assert.match(conversation, /"OSA".*回复/)
+    assert.match(conversation, /已保存到面板对话/)
+    assert.match(conversation, /已读取/)
+    assert.doesNotMatch(conversation, /501/)
+    assert.deepEqual(view.errors, [])
+    assert.deepEqual(view.warnings, [])
+  } finally { await view.unmount() }
+})
+
+test('external human retains their identity in task conversation', async () => {
+  const external = { id: 'review', source: 'github', actor: { source: 'github', id: '99' }, human: true, at: '2026-11-07T07:00:00Z', text: '协作者的评论' }
+  const ticket = { id: 't', title: '协作任务', assignments: [], inputs: [{ id: 'i', kind: 'trigger', triggerId: 'review' }], origin: { triggerIds: [] }, undelivered: ['i'], mandate: { scope: '工作' } }
+  const status = { stateDir: '/state', tickets: [ticket], projects: { projects: [{ id: 'p', name: '协作项目' }], components: [], locations: [], tasks: [{ ticket, context: { target: { projectId: 'p' } } }] }, triggers: [external] }
+  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
+  try {
+    await view.press({ text: '协作项目' })
+    await view.activateRow({ label: '项目任务' }, 't')
+    assert.match(JSON.stringify(view.tree()), /99.*github/)
+    assert.doesNotMatch(JSON.stringify(view.tree()), /你 · 2026-11-07T07:00:00Z/)
+    assert.deepEqual(view.errors, [])
+  } finally { await view.unmount() }
+})
+
+test('ignored status query keeps its exact-thread replies and shows new replies as unread', async () => {
+  const trigger = { id: 'panel:query', source: 'panel', human: true, at: '2026-11-07T07:00:00Z', text: '查询状态', channel: { source: 'panel', thread: 'request:query' }, meta: { projectId: 'p' } }
+  const status = { stateDir: '/state', tickets: [], projects: { projects: [{ id: 'p', name: '查询项目' }], components: [], locations: [], tasks: [] }, triggers: [trigger], candidates: [], routingHistory: [{ id: 'd', kind: 'ignore', triggerIds: [trigger.id] }], triggerDispositions: [{ triggerId: trigger.id, decisionId: 'd' }], outbox: [{ id: 'reply1', kind: 'reply', status: 'sent', createdAt: '2026-11-07T07:01:00Z', channel: { source: 'panel', thread: 'request:query' }, text: '查询结果' }, { id: 'other', kind: 'reply', status: 'sent', createdAt: '2026-11-07T07:01:00Z', channel: { source: 'panel', thread: 'request:other' }, text: '无关内容' }, { id: 'foreign', kind: 'reply', status: 'sent', createdAt: '2026-11-07T07:01:00Z', channel: { source: 'github', thread: 'request:query' }, text: '其他来源' }] }
+  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
+  try {
+    assert.ok(view.find({ label: '未读请求回复' }))
+    await view.press({ label: '查询状态' })
+    assert.ok(view.find({ text: '查询结果' }))
+    assert.ok(!view.find({ text: '无关内容' }))
+    assert.ok(!view.find({ text: '其他来源' }))
+    await view.press({ text: '总览' })
+    assert.ok(!view.find({ label: '未读请求回复' }))
+    await view.press({ text: '查询项目' })
+    assert.ok(view.find({ text: /已回复/ }))
+    assert.ok(view.find({ text: '查看回复' }))
+    assert.deepEqual(view.rowsOf({ label: '项目任务' }), [])
+    status.outbox.push({ id: 'reply2', kind: 'reply', status: 'sent', createdAt: '2026-11-07T07:02:00Z', channel: { source: 'panel', thread: 'request:query' }, text: '补充结果' })
+    await view.press({ text: '刷新' })
+    await view.press({ text: '总览' })
+    assert.ok(view.find({ label: '未读请求回复' }))
+    await view.press({ label: '查询状态' })
+    assert.ok(view.find({ text: '补充结果' }))
+    assert.deepEqual(view.errors, [])
+    assert.deepEqual(view.warnings, [])
+  } finally { await view.unmount() }
+})

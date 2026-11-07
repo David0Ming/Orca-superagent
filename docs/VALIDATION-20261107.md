@@ -1,14 +1,15 @@
 # 2026-11-07 开发验证记录
 
-本轮按 [开发计划](DEVELOPMENT-20261107.md) 实施。代码及隔离验证完成，真实插件加载仍待所有者授权；不宣称全部产品验收完成。
+本轮按 [开发计划](DEVELOPMENT-20261107.md) 实施。代码及隔离验证已完成；所有者已明确批准插件加载，本轮完成实际宿主连接、原生截图及插件到 Agent 的往返联调，待所有者验收。鼠标/键盘逐项自动点击的宿主限制仍单独说明。
 
 ## 自动检查
 
 | 检查 | 结果 |
 | --- | --- |
-| `rtk npm test` | 18 个文件，382 项通过 |
+| `rtk npm test`（集成基线 `6113e4f`） | 18 个文件，382 项通过 |
+| 本轮 App、GitHub、飞书回归 | 3 个文件，72 项通过 |
 | `rtk npm run typecheck` | 通过 |
-| `orca plugin test plugin/osa --json` | 9 项通过 |
+| `orca plugin test plugin/osa --json`（本轮） | 12 项通过 |
 | `orca plugin validate plugin/osa --json` | 通过 |
 | `orca plugin check plugin/osa --json` | 原生组件测试宿主渲染通过 |
 | `git diff --check` | 通过 |
@@ -45,7 +46,7 @@
 | 最终记录 | 3 个任务均 completed，4 次执行均 finished，候选 0、异常通知 0 |
 | 原文和版本 | 所有工单 Mandate 等于原始请求；CLI 返回中文与数据库原文一致；服务实际加载代码指纹 `5049f21b2d0f` |
 
-本轮不仅读取 Agent 的完成声明，也实际读取了三个成果文件。当前验证服务已停止，测试状态和成果保留以便追溯；没有恢复历史停止的业务工单。
+本轮不仅读取 Agent 的完成声明，也实际读取了三个成果文件。该阶段结束时验证服务已停止；获批加载插件后已重新启动同一隔离服务供面板验收，测试状态和成果保留。没有恢复历史停止的业务工单。
 
 ### 实测发现后修复
 
@@ -64,9 +65,34 @@
 
 ## 尚未完成与宿主限制
 
-- 代码插件首次加载需要所有者批准 `trusted-worker`、`settings:own`、`storage:own`。授权问题已提出，尚无答复。未使用 `--approve`，未把组件模拟测试当成实际面板验收。
-- 原生预览截图命令要求窗口隐藏/最小化；本次宿主仍拒绝截图，未生成或伪造截图。原 Orca 窗口已恢复。
+- 所有者已明确批准 `trusted-worker`、`settings:own`、`storage:own`，`local.osa` 0.1.0 已加载且连接隔离状态。正式 OSA 服务和来源配置未切换。
+- 已加载面板的原生截图成功。宿主的鼠标/键盘驱动仍不可用：computer 接口报告无屏幕窗口，`shot --act` 却认为窗口仍可见。为完成联调，使用插件已获准的设置 API，以及临时初始化驱动真实组件状态和既有 submit 回调；临时驱动已全部撤回。未把这些操作宣称为真实鼠标点击，也未修改 Orca 本体。
 - 当前安装版 Orca 缺少插件 TypeScript 类型文件，`plugin types` 报具体文件不存在；后端类型检查和插件运行时检查分别记录，未声称插件独立 tsc 通过。
 - 现有公开接口可切换终端；未发现结构化聊天的一键导航接口。窗口记录可按需观察，不自动导入为任务授权。
 - 多仓附加工作区保留且可查；现有 cleanup 仍针对主工作区，不自动删除附加目录。
 - GitHub 发布回归使用两个真实临时 Git 仓库和两个本地 bare remote，加 API 替身；未做线上 GitHub 发布。飞书本轮未做真实群消息测试。
+
+
+## 获批后的实际插件联调
+
+2026-11-07，插件 `local.osa` 0.1.0，Orca 1.4.251。连接路径为 `.osa/validation-20261107/state`，服务实际加载代码指纹 `9231723d563d`。
+
+- 通过插件 worker 的实际宿主入口提交请求，Router 自动接单；Executor 创建 `PANEL.txt` 并核对第一行。
+- 在真实插件的持久草稿中保存确认文字，重载后仍在。短暂停止隔离服务后，面板显示离线和旧记录；恢复连接后通过既有 submit 回调发送原草稿，接受后才清空。
+- 同一任务第二次执行复用原目录，实际文件精确为 `osa-live-panel\nosa-panel-followup\n`。只产生一条补充 Trigger，两次执行均已完成并释放槽位。
+- 追加只查询状态的请求：Router 回复后 ignore，没有创建开发任务。答复保留在原始话题中，可从项目和未读入口查看。
+- 累计隔离状态为 4 个 completed 任务、6 次 finished 执行，候选与异常通知为 0。插件日志无错误。
+
+真实显示发现并修复：消息按来源分组导致顺序错位、报告与回复重复显示、已处理查询的答复从界面消失。现按记录时间合并，无法确定时间的旧回复明确标注；不同内容的同毫秒报告均保留。外部人类协作者不被标成所有者，Router 转述也不冒称 Executor 原话。
+
+本轮改动经独立复核，相关后端 72 项及插件 12 项通过，类型检查和插件 validate/check 通过。没有为这些修复新增依赖或通用恢复框架。
+
+截图及证据仍在私有验证目录：
+
+- `panel-live-connected.png`、`panel-live-project.png`：实际项目与任务记录。
+- `panel-live-draft-restored.png`、`panel-live-offline-draft.png`：重载后草稿与断线显示。
+- `panel-live-followup-submitted.png`：真实 submit 回调接受补充后的记录。
+- `panel-live-conversation-final.png`、`panel-live-query-fixed.png`：修复后的时间线与查询答复。
+- `panel-live-final-status.json`：最终任务、输入、报告与资源事实。
+
+原生 SDK 的逐项点击、键盘焦点及暗色主题人工交互仍需所有者在实际窗口验收；组件自动测试和截图不替代这些检查。

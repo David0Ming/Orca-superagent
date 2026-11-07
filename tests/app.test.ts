@@ -278,14 +278,17 @@ test('regression: Executor question can be relayed through supported Router repl
 })
 
 test('question, acknowledgement, answer and clearing use durable core reply identities', () => {
+  vi.useFakeTimers({toFake:['Date']}); vi.setSystemTime('2026-11-07T00:00:00.000Z')
   const f = setup(); f.call(['intake'], { id: 'goal', text: 'Do it', thread: 'same' })
   const { ticketId } = f.call(['route', 'accept'], { trigger: 'goal', title: 'Goal', scope: 'Goal' })
   const assignment = f.store.tickets.get(ticketId)!.assignments[0].id
   f.store.put('capability', assignment, { token: 'secret' }); f.app.engine.assignmentStarted(ticketId, assignment)
   const auth = { ticket: ticketId, assignment, token: 'secret' }
   f.call(['acknowledge'], { ...auth, trigger: 'goal', text: 'Received' })
+  vi.setSystemTime('2026-11-07T00:01:00.000Z')
   f.call(['acknowledge'], { ...auth, trigger: 'goal', text: 'Replay' })
   expect(f.store.list<any>('outbox').filter(m => m.kind === 'acknowledgement')).toHaveLength(1)
+  expect(f.store.list<any>('outbox').find(m => m.kind === 'acknowledgement').createdAt).toBe('2026-11-07T00:00:00.000Z')
   f.call(['report', 'waiting'], { ...auth, summary: 'Need choice', question: 'Choose account?', 'asked-by': 'goal' })
   expect(f.call(['router', 'wait']).notices).toEqual(expect.arrayContaining([expect.objectContaining({kind:'attention'})]))
   f.call(['reply'], { ticket: ticketId, purpose: 'attention', question: 'Choose account?', text: 'Choose account?' })

@@ -38,7 +38,7 @@ export class App {
         return { ...ticket, execution: { name: outcome.name ?? ticket.id, directory: '', assignment: ticket.mandate.scope } }
       },
       outbox: {
-        send: message => { if (!store.get('outbox', message.id)) store.put('outbox', message.id, { ...message, status: message.channel.source === 'panel' ? 'sent' : 'pending' }) },
+        send: message => { if (!store.get('outbox', message.id)) store.put('outbox', message.id, { ...message, createdAt: new Date().toISOString(), status: message.channel.source === 'panel' ? 'sent' : 'pending' }) },
         status: id => store.get<Mail>('outbox', id)?.status,
         withdraw: id => { const mail = store.get<Mail>('outbox', id); if (mail?.status === 'pending') store.put('outbox', id, { ...mail, status: 'dropped' }) },
       },
