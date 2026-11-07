@@ -1,0 +1,537 @@
+diff --git a/src/main/persistence-settings-update.test.ts b/src/main/persistence-settings-update.test.ts
+index aced61e0ac..53fd042a29 100644
+--- a/src/main/persistence-settings-update.test.ts
++++ b/src/main/persistence-settings-update.test.ts
+@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os'
+ import type { GlobalSettings } from '../shared/global-settings-types'
+ import type { PersistedState } from '../shared/persisted-state-types'
+ import { getDefaultWorkspaceSession } from '../shared/constants'
++import { OrcaRuntimeService } from './runtime/orca-runtime'
+ 
+ import {
+   getLocalWorktreeScanGeneration,
+@@ -75,6 +76,21 @@ describe('Store', () => {
+   })
+   // ── 9. Settings: get/update ────────────────────────────────────────
+ 
++  it('persists the worker interaction policy and reads changes without restarting the runtime', async () => {
++    const store = await createStore()
++    const runtime = new OrcaRuntimeService(store)
++    expect(store.getSettings().allowAgentCloseAfterUserInput).toBe(true)
++    expect(runtime.canCloseWorkersAfterUserInput()).toBe(true)
++    store.updateSettings({ allowAgentCloseAfterUserInput: false })
++    expect(runtime.canCloseWorkersAfterUserInput()).toBe(false)
++    store.flush()
++    await closeTestStores()
++    const reopened = await createStore()
++    expect(reopened.getSettings().allowAgentCloseAfterUserInput).toBe(false)
++    reopened.updateSettings({ allowAgentCloseAfterUserInput: true })
++    expect(new OrcaRuntimeService(reopened).canCloseWorkersAfterUserInput()).toBe(true)
++  })
++
+   it('updateSettings merges partial updates', async () => {
+     const store = await createStore()
+     const initial = store.getSettings()
+diff --git a/src/main/persistence/applying-settings/settings-update.ts b/src/main/persistence/applying-settings/settings-update.ts
+index 706f910514..5b36de5276 100644
+--- a/src/main/persistence/applying-settings/settings-update.ts
++++ b/src/main/persistence/applying-settings/settings-update.ts
+@@ -78,6 +78,9 @@ export function updateSettings(
+   if ('agentSkillSharingEnabled' in updates) {
+     sanitizedUpdates.agentSkillSharingEnabled = updates.agentSkillSharingEnabled === true
+   }
++  if ('allowAgentCloseAfterUserInput' in updates) {
++    sanitizedUpdates.allowAgentCloseAfterUserInput = updates.allowAgentCloseAfterUserInput === true
++  }
+   if ('nestedWorkerMaxDepth' in updates) {
+     sanitizedUpdates.nestedWorkerMaxDepth = resolveNestedWorkerMaxDepth({
+       nestedWorkerMaxDepth: updates.nestedWorkerMaxDepth
+diff --git a/src/main/runtime/orca-runtime-resolve-worktree-selector.ts b/src/main/runtime/orca-runtime-resolve-worktree-selector.ts
+index f8c547446a..a09f65972b 100644
+--- a/src/main/runtime/orca-runtime-resolve-worktree-selector.ts
++++ b/src/main/runtime/orca-runtime-resolve-worktree-selector.ts
+@@ -123,6 +123,11 @@ export class OrcaRuntimeWithResolveWorktreeSelector extends OrcaRuntimeWithResol
+     })
+   }
+ 
++  canCloseWorkersAfterUserInput(): boolean {
++    const value = this.store?.getSettings?.().allowAgentCloseAfterUserInput
++    return value === undefined || value === true
++  }
++
+   hydrateInferredWorktreeLineage(): Promise<void> {
+     return this.worktreeLineage.hydrate()
+   }
+diff --git a/src/main/runtime/rpc/methods/client-ui.test.ts b/src/main/runtime/rpc/methods/client-ui.test.ts
+index 0894fb7d7d..aabef51947 100644
+--- a/src/main/runtime/rpc/methods/client-ui.test.ts
++++ b/src/main/runtime/rpc/methods/client-ui.test.ts
+@@ -62,23 +62,26 @@ describe('client UI RPC methods', () => {
+     expect(response).toMatchObject({ ok: true, result: { settings } })
+   })
+ 
+-  it('rejects paired attempts to mutate the host-owned structured chat setting', async () => {
+-    const runtime = {
+-      getRuntimeId: () => 'test-runtime',
+-      updateClientSettings: vi.fn()
+-    } as unknown as OrcaRuntimeService
+-    const dispatcher = new RpcDispatcher({ runtime, methods: CLIENT_UI_METHODS })
++  it.each(['experimentalNativeChat', 'allowAgentCloseAfterUserInput'])(
++    'rejects paired attempts to mutate host-owned %s',
++    async (setting) => {
++      const runtime = {
++        getRuntimeId: () => 'test-runtime',
++        updateClientSettings: vi.fn()
++      } as unknown as OrcaRuntimeService
++      const dispatcher = new RpcDispatcher({ runtime, methods: CLIENT_UI_METHODS })
+ 
+-    const response = await dispatcher.dispatch(
+-      makeRequest('settings.update', { experimentalNativeChat: true })
+-    )
++      const response = await dispatcher.dispatch(
++        makeRequest('settings.update', { [setting]: true })
++      )
+ 
+-    expect(response).toMatchObject({
+-      ok: false,
+-      error: { code: 'invalid_argument' }
+-    })
+-    expect(runtime.updateClientSettings).not.toHaveBeenCalled()
+-  })
++      expect(response).toMatchObject({
++        ok: false,
++        error: { code: 'invalid_argument' }
++      })
++      expect(runtime.updateClientSettings).not.toHaveBeenCalled()
++    }
++  )
+ 
+   it('persists the runtime host task source settings for mobile Tasks', async () => {
+     const settings = {
+diff --git a/src/main/runtime/rpc/methods/orchestration/federation/federated-release-safety.test.ts b/src/main/runtime/rpc/methods/orchestration/federation/federated-release-safety.test.ts
+index 87ac8f6535..77d1192c64 100644
+--- a/src/main/runtime/rpc/methods/orchestration/federation/federated-release-safety.test.ts
++++ b/src/main/runtime/rpc/methods/orchestration/federation/federated-release-safety.test.ts
+@@ -66,6 +66,7 @@ describe('federated worker release ownership', () => {
+   })
+ 
+   it('durably retains a user-taken-over remote worker terminal', async () => {
++    vi.spyOn(runtime, 'canCloseWorkersAfterUserInput').mockReturnValue(false)
+     createAttachment('ctx_takeover', 'created')
+     settleAttachment('ctx_takeover')
+ 
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/worker-release-ownership-guard.test.ts b/src/main/runtime/rpc/methods/orchestration/worker/worker-release-ownership-guard.test.ts
+index 9a6a399cfb..1a12efa0d4 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/worker-release-ownership-guard.test.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/worker-release-ownership-guard.test.ts
+@@ -1,4 +1,4 @@
+-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { createOrchestrationWorkerReleaseHarness } from './worker-release.test-support'
+ 
+ describe('workerRelease on a retained resource whose process exited', () => {
+@@ -6,6 +6,74 @@ describe('workerRelease on a retained resource whose process exited', () => {
+   beforeEach(() => harness.setup())
+   afterEach(() => harness.cleanup())
+ 
++  it.each(['pane', 'terminal', 'session'] as const)(
++    'allows release after %s user input by default',
++    async (address) => {
++      vi.mocked(harness.runtime.canCloseWorkersAfterUserInput).mockRestore()
++      vi.spyOn(harness.runtime, 'getStructuredWorkerPaneKeyForSession').mockReturnValue(
++        harness.workerPaneKey
++      )
++      const { dispatchId } = await harness.startSettledWorker()
++      const params =
++        address === 'pane'
++          ? { paneKey: harness.workerPaneKey }
++          : address === 'terminal'
++            ? { terminal: 'term_worker' }
++            : { sessionId: 'structured-worker' }
++      expect(harness.runtime.canCloseWorkersAfterUserInput()).toBe(true)
++      await expect(harness.call('orchestration.workerTerminalUserInput', params)).resolves.toEqual({
++        changed: 0
++      })
++      expect(harness.db.getWorkerTerminalResourceByOwner(dispatchId)?.ownership_state).toBe('owned')
++      await expect(
++        harness.call('orchestration.workerRelease', { dispatch: dispatchId })
++      ).resolves.toMatchObject({
++        state: 'released'
++      })
++      expect(harness.runtime.closeTerminal).toHaveBeenCalledTimes(1)
++    }
++  )
++
++  it('honours disabling the option and does not erase a previous takeover when re-enabled', async () => {
++    const policy = vi.mocked(harness.runtime.canCloseWorkersAfterUserInput)
++    const { dispatchId } = await harness.startSettledWorker()
++    policy.mockReturnValue(true)
++    await expect(
++      harness.call('orchestration.workerTerminalUserInput', { paneKey: harness.workerPaneKey })
++    ).resolves.toEqual({ changed: 0 })
++    policy.mockReturnValue(false)
++    await expect(
++      harness.call('orchestration.workerTerminalUserInput', { paneKey: harness.workerPaneKey })
++    ).resolves.toEqual({ changed: 1 })
++    policy.mockReturnValue(true)
++    await expect(
++      harness.call('orchestration.workerRelease', { dispatch: dispatchId })
++    ).resolves.toMatchObject({ state: 'retained', reason: 'user_takeover' })
++    expect(harness.runtime.closeTerminal).not.toHaveBeenCalled()
++  })
++
++  it('keeps explicit retention even when interaction does not take over', async () => {
++    vi.mocked(harness.runtime.canCloseWorkersAfterUserInput).mockReturnValue(true)
++    const { dispatchId } = await harness.startSettledWorker()
++    await harness.call('orchestration.workerRetain', { dispatch: dispatchId })
++    await harness.call('orchestration.workerTerminalUserInput', { paneKey: harness.workerPaneKey })
++    expect(harness.db.getWorkerTerminalResourceByOwner(dispatchId)).toMatchObject({
++      release_state: 'retained',
++      retained_reason: 'user_requested'
++    })
++    expect(harness.runtime.closeTerminal).not.toHaveBeenCalled()
++  })
++
++  it('still refuses to release an active worker with interaction cleanup enabled', async () => {
++    vi.mocked(harness.runtime.canCloseWorkersAfterUserInput).mockReturnValue(true)
++    const { dispatchId } = await harness.startWorker()
++    await harness.call('orchestration.workerTerminalUserInput', { paneKey: harness.workerPaneKey })
++    await expect(
++      harness.call('orchestration.workerRelease', { dispatch: dispatchId })
++    ).rejects.toThrow(/only a settled worker can release/)
++    expect(harness.runtime.closeTerminal).not.toHaveBeenCalled()
++  })
++
+   it('does not release a terminal the user took over', async () => {
+     const { dispatchId } = await harness.startSettledWorker('succeeded')
+     const takeover = (await harness.call('orchestration.workerTerminalUserInput', {
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/worker-release.test-support.ts b/src/main/runtime/rpc/methods/orchestration/worker/worker-release.test-support.ts
+index 0eef66d466..51283c1925 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/worker-release.test-support.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/worker-release.test-support.ts
+@@ -60,6 +60,8 @@ export function createOrchestrationWorkerReleaseHarness(): OrchestrationWorkerRe
+     db = new OrchestrationDb(':memory:')
+     dbOpen = true
+     runtime = new OrcaRuntimeService()
++    // Existing ownership tests explicitly exercise the opt-in user-input protection.
++    vi.spyOn(runtime, 'canCloseWorkersAfterUserInput').mockReturnValue(false)
+     runtime.setOrchestrationDb(db)
+     inspectProcessLiveness = vi.fn().mockResolvedValue('live')
+     ;(
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/worker-release.ts b/src/main/runtime/rpc/methods/orchestration/worker/worker-release.ts
+index 976df7ba83..aebeb4d8e1 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/worker-release.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/worker-release.ts
+@@ -139,9 +139,11 @@ export const ORCHESTRATION_WORKER_RELEASE_METHODS = [
+     // identity credential that never leaves main, so the caller names the session and the owning
+     // runtime resolves it — a renderer echoing the pane key back would make it learnable.
+     params: OrchestrationWorkerTerminalUserInputParams,
+-    // Real user keystrokes durably relinquish orchestration ownership on the owning runtime, so
+-    // restarts, SSH drops, remote viewing, and renderer remounts cannot erase the takeover.
++    // The execution host owns this policy for desktop, mobile and structured-session input alike.
+     handler: (params, { runtime }) => {
++      if (runtime.canCloseWorkersAfterUserInput()) {
++        return { changed: 0 }
++      }
+       // A structured worker reports by session id; it has no pane of its own to name.
+       const paneKey =
+         params.paneKey ??
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/worker-stop-liveness-verdict.test.ts b/src/main/runtime/rpc/methods/orchestration/worker/worker-stop-liveness-verdict.test.ts
+index fa35717998..63f9a82bfc 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/worker-stop-liveness-verdict.test.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/worker-stop-liveness-verdict.test.ts
+@@ -148,6 +148,7 @@ describe('worker-stop against a terminal we lost contact with', () => {
+   })
+ 
+   it('does not close a pane after user input transfers ownership', async () => {
++    vi.spyOn(runtime, 'canCloseWorkersAfterUserInput').mockReturnValue(false)
+     vi.spyOn(runtime, 'showTerminal').mockResolvedValue({
+       handle: 'term_worker',
+       worktreeId: 'repo::worktree',
+diff --git a/src/renderer/src/components/settings/OrchestrationPane.test.tsx b/src/renderer/src/components/settings/OrchestrationPane.test.tsx
+index e865219724..4abc3da1f5 100644
+--- a/src/renderer/src/components/settings/OrchestrationPane.test.tsx
++++ b/src/renderer/src/components/settings/OrchestrationPane.test.tsx
+@@ -216,6 +216,21 @@ describe('OrchestrationPane', () => {
+     expect(markup).toContain('aria-label="Nested worker depth"')
+   })
+ 
++  it('defaults to allowing cleanup and lets the user enable takeover protection', async () => {
++    const rendered = await renderPane()
++    const toggle = rendered.querySelector<HTMLButtonElement>(
++      'button[role="switch"][aria-label="Allow agents to close task terminals after user interaction"]'
++    )
++    if (!toggle) {
++      throw new Error('Worker terminal close option was not rendered')
++    }
++    expect(toggle.getAttribute('aria-checked')).toBe('true')
++    await act(async () => toggle.click())
++    expect(mocks.updateSettings).toHaveBeenCalledWith({ allowAgentCloseAfterUserInput: false })
++    expect(matchesSettingsSearch('takeover', getOrchestrationPaneSearchEntries())).toBe(true)
++    expect(matchesSettingsSearch('人工接管', getOrchestrationPaneSearchEntries())).toBe(true)
++  })
++
+   it('commits a whole-number depth and rejects fractional values', async () => {
+     const rendered = await renderPane()
+     const input = rendered.querySelector<HTMLInputElement>(
+@@ -247,10 +262,17 @@ describe('OrchestrationPane', () => {
+     const markup = renderToStaticMarkup(<OrchestrationPane {...getPaneProps()} />)
+ 
+     expect(markup).not.toContain('Nested worker depth')
++    expect(markup).not.toContain('Allow agents to close task terminals')
++    expect(
++      matchesSettingsSearch(
++        'takeover',
++        getOrchestrationPaneSearchEntries({ includeHostSettings: false })
++      )
++    ).toBe(false)
+     expect(
+       matchesSettingsSearch(
+         'nested worker',
+-        getOrchestrationPaneSearchEntries({ includeNestedWorkerDepth: false })
++        getOrchestrationPaneSearchEntries({ includeHostSettings: false })
+       )
+     ).toBe(false)
+   })
+diff --git a/src/renderer/src/components/settings/OrchestrationPane.tsx b/src/renderer/src/components/settings/OrchestrationPane.tsx
+index ef3df30316..6c2aa1fd3e 100644
+--- a/src/renderer/src/components/settings/OrchestrationPane.tsx
++++ b/src/renderer/src/components/settings/OrchestrationPane.tsx
+@@ -15,7 +15,11 @@ import { useActiveProjectSkillRuntime } from '@/hooks/useActiveProjectSkillRunti
+ import { SearchableSetting } from './SearchableSetting'
+ import { matchesSettingsSearch } from './settings-search'
+ import { useAppStore } from '../../store'
+-import { getOrchestrationPaneSearchEntries } from './orchestration-search'
++import {
++  getOrchestrationPaneSearchEntries,
++  getWorkerTerminalCloseTitle,
++  getWorkerTerminalCloseDescription
++} from './orchestration-search'
+ import { AgentSkillSetupPanel } from './AgentSkillSetupPanel'
+ import { buildSkillCommandForRuntime } from './CliSkillRuntimeSetup'
+ import { OrchestrationSkillAgentCoverage } from './OrchestrationSkillAgentCoverage'
+@@ -25,7 +29,7 @@ import { translate } from '@/i18n/i18n'
+ import type { GlobalSettings } from '../../../../shared/global-settings-types'
+ import { resolveNestedWorkerMaxDepth } from '../../../../shared/nested-worker-depth'
+ import { isPairedWebClientWindow } from '@/lib/desktop-window-chrome'
+-import { NumberField } from './SettingsFormControls'
++import { NumberField, SettingsSwitchRow } from './SettingsFormControls'
+ import {
+   getNestedWorkerDepthDescription,
+   getNestedWorkerDepthTitle
+@@ -53,9 +57,12 @@ export function OrchestrationPane({
+   updateSettings
+ }: OrchestrationPaneProps): React.JSX.Element {
+   const searchQuery = useAppStore((s) => s.settingsSearchQuery)
+-  const showNestedWorkerDepth = !isPairedWebClientWindow()
++  const showHostSettings = !isPairedWebClientWindow()
++  const allowAgentCloseAfterUserInput =
++    settings.allowAgentCloseAfterUserInput === undefined ||
++    settings.allowAgentCloseAfterUserInput === true
+   const searchEntries = getOrchestrationPaneSearchEntries({
+-    includeNestedWorkerDepth: showNestedWorkerDepth
++    includeHostSettings: showHostSettings
+   })
+   const showOrchestration = matchesSettingsSearch(searchQuery, searchEntries)
+   const [skillPromptOpen, setSkillPromptOpen] = useState(false)
+@@ -164,7 +171,7 @@ export function OrchestrationPane({
+         }
+       />
+ 
+-      {showNestedWorkerDepth ? (
++      {showHostSettings ? (
+         <NumberField
+           label={getNestedWorkerDepthTitle()}
+           description={getNestedWorkerDepthDescription()}
+@@ -177,6 +184,19 @@ export function OrchestrationPane({
+         />
+       ) : null}
+ 
++      {showHostSettings ? (
++        <SettingsSwitchRow
++          label={getWorkerTerminalCloseTitle()}
++          description={getWorkerTerminalCloseDescription()}
++          checked={allowAgentCloseAfterUserInput}
++          onChange={() => {
++            void updateSettings({
++              allowAgentCloseAfterUserInput: !allowAgentCloseAfterUserInput
++            })
++          }}
++        />
++      ) : null}
++
+       <OrchestrationSkillPromptDialog
+         command={orchestrationInstallCommand}
+         open={skillPromptOpen}
+diff --git a/src/renderer/src/components/settings/orchestration-search.ts b/src/renderer/src/components/settings/orchestration-search.ts
+index 5d15a6dd88..afaa5bfde9 100644
+--- a/src/renderer/src/components/settings/orchestration-search.ts
++++ b/src/renderer/src/components/settings/orchestration-search.ts
+@@ -8,10 +8,25 @@ import {
+ } from './nested-worker-depth-copy'
+ 
+ type OrchestrationPaneSearchOptions = {
+-  includeNestedWorkerDepth?: boolean
++  includeHostSettings?: boolean
+ }
+ 
+ const NESTED_WORKER_DEPTH_SEARCH_ENTRY_ID = 'nested-worker-depth'
++const WORKER_TERMINAL_CLOSE_SEARCH_ENTRY_ID = 'worker-terminal-close'
++
++export function getWorkerTerminalCloseTitle(): string {
++  return translate(
++    'auto.components.settings.OrchestrationPane.workerTerminalCloseTitle',
++    'Allow agents to close task terminals after user interaction'
++  )
++}
++
++export function getWorkerTerminalCloseDescription(): string {
++  return translate(
++    'auto.components.settings.OrchestrationPane.workerTerminalCloseDescription',
++    'Clicks, typing and paste will not automatically take over task terminals. Agents can release their completed workers; explicit retention and existing takeovers remain protected. Disable to protect terminals after user input.'
++  )
++}
+ 
+ const getAllOrchestrationPaneSearchEntries = createLocalizedCatalog(() => [
+   {
+@@ -85,16 +100,18 @@ const getAllOrchestrationPaneSearchEntries = createLocalizedCatalog(() => [
+     title: getNestedWorkerDepthTitle(),
+     description: getNestedWorkerDepthDescription(),
+     keywords: getNestedWorkerDepthSearchKeywords()
++  },
++  {
++    id: WORKER_TERMINAL_CLOSE_SEARCH_ENTRY_ID,
++    title: getWorkerTerminalCloseTitle(),
++    description: getWorkerTerminalCloseDescription(),
++    keywords: ['takeover', 'close', 'retain', '人工接管', '关闭', '保留']
+   }
+ ])
+ 
+ export function getOrchestrationPaneSearchEntries({
+-  includeNestedWorkerDepth = true
++  includeHostSettings = true
+ }: OrchestrationPaneSearchOptions = {}) {
+   const entries = getAllOrchestrationPaneSearchEntries()
+-  return includeNestedWorkerDepth
+-    ? entries
+-    : entries.filter(
+-        (entry) => !('id' in entry) || entry.id !== NESTED_WORKER_DEPTH_SEARCH_ENTRY_ID
+-      )
++  return includeHostSettings ? entries : entries.filter((entry) => !('id' in entry))
+ }
+diff --git a/src/renderer/src/hooks/settings-navigation-capability-sections.ts b/src/renderer/src/hooks/settings-navigation-capability-sections.ts
+index e06a1ae450..ed34c2b7c5 100644
+--- a/src/renderer/src/hooks/settings-navigation-capability-sections.ts
++++ b/src/renderer/src/hooks/settings-navigation-capability-sections.ts
+@@ -72,7 +72,7 @@ export function buildCapabilitySettingsSections({
+       ),
+       icon: Network,
+       searchEntries: getOrchestrationPaneSearchEntries({
+-        includeNestedWorkerDepth: !isWebClient
++        includeHostSettings: !isWebClient
+       }),
+       group: 'capabilities'
+     },
+diff --git a/src/renderer/src/i18n/locales/en.json b/src/renderer/src/i18n/locales/en.json
+index 6d291a1463..f40611cb56 100644
+--- a/src/renderer/src/i18n/locales/en.json
++++ b/src/renderer/src/i18n/locales/en.json
+@@ -8045,6 +8045,8 @@
+           "07641b9768": "Orchestration skill",
+           "2aacdb0517": "Coordinate coding agents across handoffs, worktree handovers, and child-agent work.",
+           "191ac34567": "Agent Orchestration",
++          "workerTerminalCloseTitle": "Allow agents to close task terminals after user interaction",
++          "workerTerminalCloseDescription": "Clicks, typing and paste will not automatically take over task terminals. Agents can release their completed workers; explicit retention and existing takeovers remain protected. Disable to protect terminals after user input.",
+           "nestedWorkerDepthTitle": "Nested worker depth",
+           "nestedWorkerDepthDescription": "How many generations of dispatched workers may spawn their own workers. 1 keeps the agent tree flat: a coordinator dispatches workers, and those workers do not dispatch."
+         },
+diff --git a/src/renderer/src/i18n/locales/es.json b/src/renderer/src/i18n/locales/es.json
+index 40f08806c8..917a339e08 100644
+--- a/src/renderer/src/i18n/locales/es.json
++++ b/src/renderer/src/i18n/locales/es.json
+@@ -7770,6 +7770,8 @@
+           "07641b9768": "Skill de orquestación",
+           "2aacdb0517": "Coordina agentes de programación en handoffs, handoffs de worktree y trabajo de agentes secundarios.",
+           "191ac34567": "Orquestación de agentes",
++          "workerTerminalCloseTitle": "Permitir que los agentes cierren terminales de tareas tras una interacción",
++          "workerTerminalCloseDescription": "Los clics, la escritura y el pegado no transfieren el control automáticamente. Los agentes pueden liberar sus tareas terminadas. La conservación explícita y las transferencias existentes siguen protegidas. Desactiva esta opción para proteger los terminales tras una entrada del usuario.",
+           "nestedWorkerDepthTitle": "Profundidad del trabajador anidado",
+           "nestedWorkerDepthDescription": "¿Cuántas generaciones de trabajadores despedidos pueden engendrar sus propios trabajadores? 1 mantiene el árbol de agentes plano: un coordinador envía trabajadores y esos trabajadores no envían."
+         },
+diff --git a/src/renderer/src/i18n/locales/fr.json b/src/renderer/src/i18n/locales/fr.json
+index c5103ea65a..2cb7238d45 100644
+--- a/src/renderer/src/i18n/locales/fr.json
++++ b/src/renderer/src/i18n/locales/fr.json
+@@ -7907,6 +7907,8 @@
+           "07641b9768": "Skill d'orchestration",
+           "2aacdb0517": "Coordonnez les agents de codage entre passations, transferts de worktree et travaux d'agents enfants.",
+           "191ac34567": "Orchestration d'agents",
++          "workerTerminalCloseTitle": "Autoriser les agents à fermer les terminaux de tâche après une interaction",
++          "workerTerminalCloseDescription": "Les clics, la saisie et le collage ne transfèrent plus automatiquement le contrôle. Les agents peuvent libérer leurs tâches terminées. La conservation explicite et les prises de contrôle existantes restent protégées. Désactivez cette option pour protéger les terminaux après une saisie.",
+           "nestedWorkerDepthTitle": "Profondeur du travailleur imbriqué",
+           "nestedWorkerDepthDescription": "Combien de générations de travailleurs détachés peuvent engendrer leurs propres travailleurs. 1 maintient l'arborescence des agents à plat : un coordinateur répartit les travailleurs, et ces travailleurs ne répartissent pas."
+         },
+diff --git a/src/renderer/src/i18n/locales/ja.json b/src/renderer/src/i18n/locales/ja.json
+index 90c53e14e5..ba6a31d962 100644
+--- a/src/renderer/src/i18n/locales/ja.json
++++ b/src/renderer/src/i18n/locales/ja.json
+@@ -7792,6 +7792,8 @@
+           "07641b9768": "オーケストレーションスキル",
+           "2aacdb0517": "ハンドオフ、ワークツリーのハンドオーバー、および子 Agent の作業全体にわたってコーディング Agent を調整します。",
+           "191ac34567": "Agent オーケストレーション",
++          "workerTerminalCloseTitle": "ユーザー操作後もエージェントによるタスク端末の終了を許可",
++          "workerTerminalCloseDescription": "クリック、入力、貼り付けではタスク端末を自動的に引き継ぎません。エージェントは完了した自身のワーカーを解放できます。明示的な保持と既存の引き継ぎは保護されます。無効にするとユーザー入力後に保護されます。",
+           "nestedWorkerDepthTitle": "ネストされたワーカーの深さ",
+           "nestedWorkerDepthDescription": "派遣労働者が何世代にもわたって自らの労働者を生み出す可能性がある。 1 は Agent ツリーをフラットに保ちます。コーディネーターがワーカーを派遣し、それらのワーカーは派遣しません。"
+         },
+diff --git a/src/renderer/src/i18n/locales/ko.json b/src/renderer/src/i18n/locales/ko.json
+index 2203c5ef8c..2bcc354187 100644
+--- a/src/renderer/src/i18n/locales/ko.json
++++ b/src/renderer/src/i18n/locales/ko.json
+@@ -7755,6 +7755,8 @@
+           "07641b9768": "오케스트레이션 스킬",
+           "2aacdb0517": "핸드오프, 작업 트리 핸드오버, 하위 agents 작업 전반에 걸쳐 코딩 agents를 조정합니다.",
+           "191ac34567": "Agent 오케스트레이션",
++          "workerTerminalCloseTitle": "사용자 조작 후에도 에이전트가 작업 터미널을 닫도록 허용",
++          "workerTerminalCloseDescription": "클릭, 입력, 붙여넣기로 작업 터미널을 자동 인계하지 않습니다. 에이전트는 완료된 자신의 작업 터미널을 해제할 수 있습니다. 명시적 보존과 기존 인계는 계속 보호됩니다. 끄면 사용자 입력 후 터미널이 보호됩니다.",
+           "nestedWorkerDepthTitle": "중첩된 작업자 깊이",
+           "nestedWorkerDepthDescription": "디스패치근로자가 몇 세대에 걸쳐 자신의 근로자를 낳을 수 있는가. 1은 에이전트 트리를 플랫하게 유지합니다. 코디네이터는 작업자를 디스패치하고 해당 작업자는 디스패치하지 않습니다."
+         },
+diff --git a/src/renderer/src/i18n/locales/zh.json b/src/renderer/src/i18n/locales/zh.json
+index 9501aa698e..c4130be8f3 100644
+--- a/src/renderer/src/i18n/locales/zh.json
++++ b/src/renderer/src/i18n/locales/zh.json
+@@ -7755,6 +7755,8 @@
+           "07641b9768": "编排技能",
+           "2aacdb0517": "跨切换、工作树切换和子智能体工作协调编码智能体。",
+           "191ac34567": "智能体编排",
++          "workerTerminalCloseTitle": "允许智能体关闭人工操作过的任务窗口",
++          "workerTerminalCloseDescription": "开启后，点击、键盘输入和粘贴不再自动接管任务窗口，智能体仍可释放已完成的自有任务窗口。明确保留及已有接管标记继续受保护。关闭后，人工输入会触发接管保护。",
+           "nestedWorkerDepthTitle": "嵌套工人深度",
+           "nestedWorkerDepthDescription": "多少代的派遣工可能会产生自己的工人。 1 保持智能体树平坦：协调者调度工人，而那些工人不调度。"
+         },
+diff --git a/src/shared/default-global-settings.ts b/src/shared/default-global-settings.ts
+index e644e997cc..9fcc039dc4 100644
+--- a/src/shared/default-global-settings.ts
++++ b/src/shared/default-global-settings.ts
+@@ -155,6 +155,7 @@ export function buildDefaultSettings(args: {
+     artifactSharingEnabled: false,
+     agentSkillSharingEnabled: false,
+     nestedWorkerMaxDepth: 1,
++    allowAgentCloseAfterUserInput: true,
+     showArtifactsButton: false,
+     showSkillsButton: false,
+     showMobileButton: true,
+diff --git a/src/shared/global-settings-types.ts b/src/shared/global-settings-types.ts
+index a802248782..2d95f4165f 100644
+--- a/src/shared/global-settings-types.ts
++++ b/src/shared/global-settings-types.ts
+@@ -264,6 +264,8 @@ export type GlobalSettings = NativeChatGlobalSettings & {
+    *  Renderer-writable only: omitted from the SettingsUpdate RPC schema so a worker
+    *  cannot raise its own cap via `orca settings update`. */
+   nestedWorkerMaxDepth?: number
++  /** Renderer-writable only; user input does not transfer worker ownership when enabled. */
++  allowAgentCloseAfterUserInput?: boolean
+   /** Only toggles the sidebar shortcut; Artifacts stay reachable from Settings. */
+   showArtifactsButton?: boolean
+   /** Only toggles the sidebar shortcut; Skills stay reachable from Settings. */

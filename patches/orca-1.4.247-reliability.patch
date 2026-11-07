@@ -1,0 +1,2782 @@
+diff --git a/src/main/native-chat/agent-session-journal/journal-database-schema.ts b/src/main/native-chat/agent-session-journal/journal-database-schema.ts
+index 371afc55..24dab778 100644
+--- a/src/main/native-chat/agent-session-journal/journal-database-schema.ts
++++ b/src/main/native-chat/agent-session-journal/journal-database-schema.ts
+@@ -1,7 +1,7 @@
+ // Keep legacy repair/import/set-aside tables for older clients using the same schema version.
+ 
+ /** Database version is independent of row versions; newer databases must remain read-only. */
+-export const JOURNAL_DB_SCHEMA_VERSION = 4
++export const JOURNAL_DB_SCHEMA_VERSION = 5
+ 
+ // Versions 1–2 existed only in unreleased builds.
+ export const JOURNAL_DB_OLDEST_RELEASED_VERSION = 3
+diff --git a/src/main/native-chat/agent-session-journal/journal-database.ts b/src/main/native-chat/agent-session-journal/journal-database.ts
+index f35089c9..399da2f0 100644
+--- a/src/main/native-chat/agent-session-journal/journal-database.ts
++++ b/src/main/native-chat/agent-session-journal/journal-database.ts
+@@ -1,3 +1,4 @@
++import { createInputStreamTables } from './journal-input-stream'
+ // Read user_version before persistent pragmas/DDL: even enabling WAL mutates newer databases.
+ 
+ import { ensureJournalOutcomeTables } from './journal-outcome-format'
+@@ -111,6 +112,7 @@ function migrateJournalSchema(db: Database.Database, stored: number): void {
+       db.exec(createJournalTablesSql())
+     }
+     db.exec(createAgentSessionRecordTablesSql())
++    createInputStreamTables(db)
+     db.pragma(`user_version = ${JOURNAL_DB_SCHEMA_VERSION}`)
+   })
+ }
+diff --git a/src/main/native-chat/agent-session-journal/journal-row-writer.ts b/src/main/native-chat/agent-session-journal/journal-row-writer.ts
+index c3bbabfc..f5b6334d 100644
+--- a/src/main/native-chat/agent-session-journal/journal-row-writer.ts
++++ b/src/main/native-chat/agent-session-journal/journal-row-writer.ts
+@@ -1,3 +1,4 @@
++import { captureJournalInputs } from './journal-input-stream'
+ import type Database from '../../sqlite/sync-database'
+ import { insertJournalRow } from './journal-row-table'
+ import type { JournalHostDatabase } from './journal-host-database'
+@@ -73,6 +74,7 @@ export class JournalRowWriter {
+             insertJournalRow(db, this.deps.sessionId, row, savedAt)
+           }
+           const adopt = this.deps.prepare?.(db, [row], savedAt)
++          captureJournalInputs(db, this.deps.sessionId, [row])
+           receipt?.write(db, row)
+           return adopt
+         },
+@@ -120,6 +122,7 @@ export class JournalRowWriter {
+           }
+         }
+         const adopt = this.deps.prepare?.(db, rows, ts)
++        captureJournalInputs(db, this.deps.sessionId, rows)
+         receipt?.write(db, receiptRow?.(rows))
+         return adopt
+       },
+diff --git a/src/main/native-chat/agent-session-journal/journal-submission-writer.ts b/src/main/native-chat/agent-session-journal/journal-submission-writer.ts
+index a610a07c..98f94456 100644
+--- a/src/main/native-chat/agent-session-journal/journal-submission-writer.ts
++++ b/src/main/native-chat/agent-session-journal/journal-submission-writer.ts
+@@ -35,7 +35,8 @@ export class JournalSubmissionWriter {
+     /** Validate the linked card on the write lane: one handoff, one delivery. */
+     consume?: JournalSubmissionConsume,
+     /** Commit the send's ledger answer with the row. */
+-    receipt?: JournalOperationReceipt
++    receipt?: JournalOperationReceipt,
++    beforeCommit?: () => void
+   ): Promise<AgentJournalCursor> {
+     const { claimAttachments, identity, queuedMessages, rowWriter, state } = this.deps
+     const submission = journalSubmissionRowBuilder(state, identity, input, consume)
+@@ -68,6 +69,7 @@ export class JournalSubmissionWriter {
+         },
+         {
+           write: (db, row) => {
++            beforeCommit?.()
+             card?.receipt.write(db)
+             // New client sends require stored uploads; queued cards already claimed theirs.
+             claimsCommitted = claimAttachments(
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-conversation-reads.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-conversation-reads.ts
+index c5fe54ee..00e328e4 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-conversation-reads.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-conversation-reads.ts
+@@ -1,3 +1,4 @@
++import { useInputStream } from '../agent-session-journal/journal-input-stream'
+ import {
+   createStructuredAgentSessionCatalogReads,
+   structuredAgentSessionCatalogScopeOwned
+@@ -54,6 +55,12 @@ export function createStructuredAgentSessionConversationReads(context: () => Rea
+   }))
+   const journalOf = async (id: string) => (await context().conversation(id)).journal
+   return {
++    inputStream: async (input: Parameters<typeof useInputStream>[1]) => {
++      const journal = await journalOf(input.sessionId)
++      return journal.readInOrder(() =>
++        context().deps.journalDatabase.transaction((db) => useInputStream(db, input))
++      )
++    },
+     readModelCatalog,
+     queuedSendAnswer: async (id: string, messageId: string) =>
+       queuedSendAnswer(await journalOf(id), messageId),
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts
+index 10a86a57..7005fd7c 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-host.ts
+@@ -5,7 +5,6 @@ import { structuredAgentStartJournal } from './structured-agent-start-journal'
+ import { StructuredConversationCommandController } from './structured-conversation-command-controller'
+ // Serialize durable mutations per conversation; open at rest and start a child only when work needs it.
+ 
+-import type { AgentSessionSubscribeInput } from './structured-agent-session-subscribers'
+ import { createStartupRecovery } from './structured-agent-session-restart-reconcile'
+ import { StructuredAgentSessionTaskQueue } from './structured-agent-session-task-queue'
+ import { StructuredAgentSessionHostRuntimeState } from './structured-agent-session-host-runtime-state'
+@@ -295,6 +294,7 @@ export class StructuredAgentSessionHost {
+ 
+   conversationCommand = this.conversationCommands.run
+   /** Undefined means unavailable; an empty array is an authoritative catalog. */
++  inputStream = this.reads.inputStream
+   readCommands = this.reads.readCommands
+ 
+   /** Read the store; idle-released chats have no session-map entry. */
+@@ -304,9 +304,9 @@ export class StructuredAgentSessionHost {
+ 
+   readonly continuationContext: ReturnType<typeof contextReader>
+ 
+-  observeConversationPublications: typeof this.sessions.observeConversationPublications = (
+-    ...args
+-  ) => this.sessions.observeConversationPublications(...args)
++  observeConversationPublications = this.sessions.observeConversationPublications.bind(
++    this.sessions
++  )
+   journalSnapshot = (sessionId: string) => this.backgroundTasks.journalSnapshot(sessionId)
+   queuedSendAnswer = this.reads.queuedSendAnswer
+   /** What became of one send, answered by key, for callers that follow many sends. */
+@@ -326,7 +326,7 @@ export class StructuredAgentSessionHost {
+ 
+   observeJournalPublications = this.clientDelivery.observeJournalPublications
+ 
+-  subscribe = (input: AgentSessionSubscribeInput) => this.backgroundTasks.subscribe(input)
++  subscribe: BackgroundTasks['subscribe'] = (input) => this.backgroundTasks.subscribe(input)
+ 
+   settleLateDispatch = this.mutations.settleLateDispatch
+   /** Republish row-free changes to held work. */
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-mutation-plans.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-mutation-plans.ts
+index b0d78c90..45311ecd 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-mutation-plans.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-mutation-plans.ts
+@@ -154,6 +154,7 @@ export function sendPlan(
+       params.beforeRun?.()
+       const source = sendSource(params)
+       return performSend(ctx, {
++        beforeCommit: params.beforeRun,
+         origin: params.userSend ? 'client' : 'host',
+         ...(source ? { source } : {}),
+         clientMessageId,
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-send.test.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-send.test.ts
+index d0e199dd..42a3ccec 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-send.test.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-send.test.ts
+@@ -551,3 +551,22 @@ describe('send', () => {
+     ).toMatchObject({ ok: false, refusal: { code: 'agent_session_ownership_unknown' } })
+   })
+ })
++
++it('rechecks automated admission inside the durable submission transaction', async () => {
++  await attach()
++  const beforeRun = vi.fn(() => {
++    if (beforeRun.mock.calls.length > 1) {
++      throw new Error('managed delivery revoked at commit')
++    }
++  })
++  const body = hostTestMessage('obsolete task')
++  const result = await host.send(CALLER, {
++    envelope: envelope('agentSession.send', { body }),
++    body,
++    beforeRun
++  })
++  expect(result.ok).toBe(false)
++  expect(beforeRun).toHaveBeenCalledTimes(2)
++  expect(hostJournal().submissions()).toHaveLength(0)
++  expect(dispatch).not.toHaveBeenCalled()
++})
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-turns.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-turns.ts
+index e843f570..ad076118 100644
+--- a/src/main/native-chat/agent-session-wire/structured-agent-session-turns.ts
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-turns.ts
+@@ -92,6 +92,7 @@ export function agentSessionAttachmentExpiredRefusal(error: AgentSessionAttachme
+ export async function performSend(
+   ctx: AgentSessionTurnContext,
+   input: {
++    beforeCommit?: () => void
+     clientMessageId: string
+     payloadFingerprint: string
+     body: AgentJournalMessageItem
+@@ -123,10 +124,12 @@ export async function performSend(
+     return { ok: false, refusal: captured.refusal }
+   }
+   try {
++    const { beforeCommit, ...submission } = input
+     await ctx.journal.appendSubmission(
+-      { ...input, options: captured.options, fence: ctx.fence, handoverRecorded: true },
++      { ...submission, options: captured.options, fence: ctx.fence, handoverRecorded: true },
+       undefined,
+-      ctx.operationReceipt
++      ctx.operationReceipt,
++      beforeCommit
+     )
+   } catch (error) {
+     if (error instanceof CommandReceiptExistsError) {
+diff --git a/src/main/runtime/orchestration/db/orchestration-db.ts b/src/main/runtime/orchestration/db/orchestration-db.ts
+index 8aacd47b..ac6387d3 100644
+--- a/src/main/runtime/orchestration/db/orchestration-db.ts
++++ b/src/main/runtime/orchestration/db/orchestration-db.ts
+@@ -1,3 +1,4 @@
++import { MANAGED_RUN_SCHEMA } from '../managed-run'
+ import { CrewChanges } from '../crew/crew-changes'
+ import Database from '../../../sqlite/sync-database'
+ import { attachOrchestrationDbMethods } from './attach-orchestration-db-methods'
+@@ -44,6 +45,10 @@ class OrchestrationDbCore {
+     // Read before migrate, which drops the capture triggers it may need to rebuild around.
+     const removedWorkCaptureWasIntact = isRemovedWorkCaptureIntact(this.db)
+     migrate.call(this as unknown as OrchestrationDb)
++    this.db.exec(MANAGED_RUN_SCHEMA)
++    if (this.db.prepare('SELECT 1 FROM managed_runs LIMIT 1').get()) {
++      this.db.pragma('synchronous = FULL')
++    }
+     createRunCoordinatorAddressTriggers(this.db)
+     backfillFederatedStubHomeRuns(this.db)
+     // After every open step that creates Runs, before any step that deletes work.
+diff --git a/src/main/runtime/orchestration/db/schema/create-tables.ts b/src/main/runtime/orchestration/db/schema/create-tables.ts
+index 1895230e..5f465a6b 100644
+--- a/src/main/runtime/orchestration/db/schema/create-tables.ts
++++ b/src/main/runtime/orchestration/db/schema/create-tables.ts
+@@ -1,3 +1,4 @@
++import { MANAGED_RUN_SCHEMA } from '../../managed-run'
+ import type { OrchestrationDb } from '../orchestration-db'
+ import { createCoreTablesSql } from './create-core-tables-sql'
+ import { createGraphTablesSql } from './create-graph-tables-sql'
+@@ -6,6 +7,7 @@ import { REMOVED_WORK_SCHEMA_SQL } from '../reset/removed-orchestration-work-sto
+ 
+ export function createTables(this: OrchestrationDb): void {
+   this.db.exec(`${createCoreTablesSql()}\n${createGraphTablesSql()}\n${REMOVED_WORK_SCHEMA_SQL}`)
++  this.db.exec(MANAGED_RUN_SCHEMA)
+   // Unreleased builds saved each send's fence as NOT NULL; nothing reads it, and new rows carry none.
+   if (this.hasColumn('structured_mail_sends', 'fence')) {
+     this.db.exec('ALTER TABLE structured_mail_sends DROP COLUMN fence')
+diff --git a/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-start.ts b/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-start.ts
+index a3384223..f3048f32 100644
+--- a/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-start.ts
++++ b/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-start.ts
+@@ -1,3 +1,4 @@
++import { consumeManagedStart } from '../../managed-run'
+ import type { DispatchContextRow, TaskRow, WorkerDispatchRow } from '../../types'
+ import { OrchestrationError } from '../../orchestration-error'
+ import { ensureMutationReceiptCapacity } from '../../mutation-receipt-capacity'
+@@ -13,6 +14,7 @@ import { getFollowUpDispatch, takeFollowUpMail } from '../dispatch-context/worke
+ export function createStartingWorkerDispatch(
+   this: OrchestrationDb,
+   params: {
++    managedIntent?: string
+     taskId?: string
+     taskSpec?: string
+     taskRunId?: string
+@@ -174,6 +176,7 @@ export function createStartingWorkerDispatch(
+           accepting.requestId
+         )
+     }
++    consumeManagedStart(this.db, task.run_id, id, params.managedIntent)
+     insertStartingDispatchContextRow(this.db, {
+       id,
+       runId: task.run_id,
+diff --git a/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-stop.ts b/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-stop.ts
+index 9cc02e98..8db7f7c7 100644
+--- a/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-stop.ts
++++ b/src/main/runtime/orchestration/db/worker-dispatch/worker-dispatch-stop.ts
+@@ -1,3 +1,4 @@
++import { assertManagedStop } from '../../managed-run'
+ import type { DispatchContextRow, WorkerDispatchRow } from '../../types'
+ import { OrchestrationError } from '../../orchestration-error'
+ import {
+@@ -57,6 +58,7 @@ export function beginWorkerStop(
+     if (!dispatch) {
+       throw new OrchestrationError('dispatch_not_found', `Dispatch ${dispatchId} was not found.`)
+     }
++    assertManagedStop(this.db, dispatch.run_id, dispatchId)
+     if (!worker) {
+       const released = releaseContextOnlyDispatch(this.db, dispatch, 'stopped')
+       if (!released.alreadySettled) {
+diff --git a/src/main/runtime/rpc/methods/orchestration-structured-worker-session.ts b/src/main/runtime/rpc/methods/orchestration-structured-worker-session.ts
+index 591ababd..5c33b92b 100644
+--- a/src/main/runtime/rpc/methods/orchestration-structured-worker-session.ts
++++ b/src/main/runtime/rpc/methods/orchestration-structured-worker-session.ts
+@@ -210,6 +210,7 @@ export async function sendStructuredWorkerPreamble(args: {
+   from: AgentMessageSource
+   /** The worker start's readiness budget, which the agent's start counts against. */
+   budgetMs?: number
++  beforeRun?: () => void
+ }): Promise<'accepted' | 'pending'> {
+   const body: AgentJournalMessageItem = {
+     kind: 'message',
+@@ -230,6 +231,7 @@ export async function sendStructuredWorkerPreamble(args: {
+     turn: {
+       body,
+       delivery: 'now',
++      beforeRun: args.beforeRun,
+       operationId: mintAgentSessionOperationId(Date.now()),
+       expectedRuntimeFence: fence
+     }
+diff --git a/src/main/runtime/rpc/methods/orchestration.ts b/src/main/runtime/rpc/methods/orchestration.ts
+index fda3043d..480fde40 100644
+--- a/src/main/runtime/rpc/methods/orchestration.ts
++++ b/src/main/runtime/rpc/methods/orchestration.ts
+@@ -1,3 +1,5 @@
++import { ORCHESTRATION_MANAGED_REPORT_METHODS } from './orchestration/managed-report-methods'
++import { ORCHESTRATION_MANAGED_METHODS } from './orchestration/managed-methods'
+ import { requiringOrcadFeature } from '../orcad-feature-readiness'
+ import { ORCHESTRATION_CREW_METHODS } from './orchestration/crew-methods'
+ import { ORCHESTRATION_RUN_METHODS } from './orchestration/runs/runs'
+@@ -15,6 +17,8 @@ import { ORCHESTRATION_CALLER_METHODS } from './orchestration/caller-show'
+ 
+ // Every orchestration method reads the authority restored at startup.
+ export const ORCHESTRATION_METHODS = requiringOrcadFeature('orchestration', [
++  ...ORCHESTRATION_MANAGED_METHODS,
++  ...ORCHESTRATION_MANAGED_REPORT_METHODS,
+   ...ORCHESTRATION_CREW_METHODS,
+   ...ORCHESTRATION_RUN_METHODS,
+   ...ORCHESTRATION_WORKER_METHODS,
+diff --git a/src/main/runtime/rpc/methods/orchestration/chat-task-delivery.ts b/src/main/runtime/rpc/methods/orchestration/chat-task-delivery.ts
+index a58a8838..37d64891 100644
+--- a/src/main/runtime/rpc/methods/orchestration/chat-task-delivery.ts
++++ b/src/main/runtime/rpc/methods/orchestration/chat-task-delivery.ts
+@@ -38,6 +38,7 @@ export async function sendChatTask(args: {
+   /** Who the task is from (`dispatchTaskSource`), shown on the chat's card or turn. */
+   from: AgentMessageSource
+   preamble: string
++  beforeRun?: () => void
+ }): Promise<ChatTaskDelivery> {
+   const sessionId = args.dispatch.assignee_orca_session_id
+   const host = getStructuredAgentSessionHost()
+@@ -65,7 +66,8 @@ export async function sendChatTask(args: {
+     turn: {
+       body,
+       // As a person's message is: a busy chat queues it as a card, sent when the queue reaches it.
+-      delivery: 'queue',
++      delivery: args.beforeRun ? 'now' : 'queue',
++      beforeRun: args.beforeRun,
+       operationId: chatTaskOperationId(args.dispatch),
+       expectedRuntimeFence: observed.session.currentFence
+     }
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/deliver-worker-dispatch-preamble.ts b/src/main/runtime/rpc/methods/orchestration/worker/deliver-worker-dispatch-preamble.ts
+index 9ccdf0fb..dfa0d27e 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/deliver-worker-dispatch-preamble.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/deliver-worker-dispatch-preamble.ts
+@@ -1,3 +1,4 @@
++import { deliverManaged } from '../../../../orchestration/managed-delivery'
+ import type { RuntimeTerminalSend } from '../../../../../../shared/runtime-terminal-contracts'
+ import type { OrcaRuntimeService } from '../../../../orca-runtime'
+ import type { OrchestrationDb } from '../../../../orchestration/db'
+@@ -48,77 +49,98 @@ export async function deliverWorkerDispatchPreamble(args: {
+   prompt?: RuntimeTerminalSend['prompt']
+   structuredTurnStart?: WorkerTurnStartObservation
+ }> {
+-  const { runtime, structuredSession, terminalHandle } = args
+-  // A reused structured worker is a chat too, though its handle is not an Orca session ID.
+-  const chat = structuredSession
+-    ? null
+-    : chatAssigneeOf(resolveDispatchAssigneeParty(terminalHandle, args.db))
+-  const preamble = buildDispatchPreamble({
+-    // Only depth gates nesting; resolve structured callers' workspace so they can dispatch like PTY workers.
+-    canDispatchSubWorkers: args.dispatchDepth < runtime.getNestedWorkerMaxDepth(),
+-    taskId: args.taskId,
+-    dispatchId: args.dispatchId,
+-    taskSpec: args.taskSpec,
+-    coordinatorHandle: orcaSessionIdOrHandle(args.coordinatorHandle, args.db),
+-    // Its mailbox stays keyed by the handle; its commands name its Orca session ID, which binds to it.
+-    workerHandle:
+-      structuredSession && isOrcaSessionId(structuredSession.identity.sessionId)
+-        ? formatOrcaSessionAddress(canonicalOrcaSessionId(structuredSession.identity.sessionId))
+-        : chat
+-          ? formatOrcaSessionAddress(chat)
+-          : terminalHandle,
+-    devMode: args.devMode,
+-    cliCommand: runtime.getTerminalOrchestrationCliCommand(terminalHandle),
+-    unreadMail: args.db.getLatestUnreadMessageSequence(`dispatch:${args.dispatchId}`) !== undefined
+-  })
+-  if (chat) {
+-    const dispatch = args.db.getDispatchContextById(args.dispatchId)
+-    if (!dispatch) {
+-      throw new OrchestrationError(
+-        'dispatch_not_found',
+-        `Dispatch ${args.dispatchId} was not found.`
+-      )
++  return deliverManaged(args.db, args.runId, args.dispatchId, async (taskSpec, managed) => {
++    if (taskSpec !== undefined) {
++      args = { ...args, taskSpec }
+     }
+-    const from = workerTaskSource(args)
+-    const delivery = await sendChatTask({ db: args.db, dispatch, from, preamble })
+-    return { structuredTurnStart: chatTaskTurnStart(delivery) }
+-  }
+-  if (structuredSession) {
+-    const delivery = await sendStructuredWorkerPreamble({
+-      host: structuredSession.host,
+-      sessionId: structuredSession.identity.sessionId,
++    const { runtime, structuredSession, terminalHandle } = args
++    // A reused structured worker is a chat too, though its handle is not an Orca session ID.
++    const chat = structuredSession
++      ? null
++      : chatAssigneeOf(resolveDispatchAssigneeParty(terminalHandle, args.db))
++    const preamble = buildDispatchPreamble({
++      // Only depth gates nesting; resolve structured callers' workspace so they can dispatch like PTY workers.
++      canDispatchSubWorkers: args.dispatchDepth < runtime.getNestedWorkerMaxDepth(),
++      taskId: args.taskId,
+       dispatchId: args.dispatchId,
+-      preamble,
+-      from: workerTaskSource(args),
+-      ...(args.readinessTimeoutMs === undefined ? {} : { budgetMs: args.readinessTimeoutMs })
++      taskSpec: args.taskSpec,
++      coordinatorHandle: orcaSessionIdOrHandle(args.coordinatorHandle, args.db),
++      // Its mailbox stays keyed by the handle; its commands name its Orca session ID, which binds to it.
++      workerHandle:
++        structuredSession && isOrcaSessionId(structuredSession.identity.sessionId)
++          ? formatOrcaSessionAddress(canonicalOrcaSessionId(structuredSession.identity.sessionId))
++          : chat
++            ? formatOrcaSessionAddress(chat)
++            : terminalHandle,
++      devMode: args.devMode,
++      cliCommand: runtime.getTerminalOrchestrationCliCommand(terminalHandle),
++      unreadMail:
++        args.db.getLatestUnreadMessageSequence(`dispatch:${args.dispatchId}`) !== undefined
+     })
+-    return {
+-      structuredTurnStart:
+-        delivery === 'accepted'
+-          ? { verdict: 'observed' }
+-          : {
+-              verdict: 'unobserved',
+-              reason:
+-                'The dispatch preamble was accepted, but the agent had not started to take it. It ' +
+-                'is delivered when the agent starts; if the worker then reports, this Dispatch ' +
+-                'settles normally.'
+-            }
++    if (chat) {
++      const dispatch = args.db.getDispatchContextById(args.dispatchId)
++      if (!dispatch) {
++        throw new OrchestrationError(
++          'dispatch_not_found',
++          `Dispatch ${args.dispatchId} was not found.`
++        )
++      }
++      const from = workerTaskSource(args)
++      const delivery = await sendChatTask({
++        db: args.db,
++        dispatch,
++        from,
++        preamble,
++        beforeRun: managed?.assertCurrent
++      })
++      return { structuredTurnStart: chatTaskTurnStart(delivery) }
+     }
+-  }
+-  // A shell back at its prompt also reads as ready, so the brief needs the agent found in front.
+-  const briefGuard = createWorkerBriefWriteGuard(runtime, args.launchedAgent, !!args.launchedAgent)
+-  try {
+-    const sent = await sendAgentTurn({
+-      kind: 'terminal',
++    if (structuredSession) {
++      const delivery = await sendStructuredWorkerPreamble({
++        host: structuredSession.host,
++        sessionId: structuredSession.identity.sessionId,
++        dispatchId: args.dispatchId,
++        preamble,
++        from: workerTaskSource(args),
++        beforeRun: managed?.assertCurrent,
++        ...(args.readinessTimeoutMs === undefined ? {} : { budgetMs: args.readinessTimeoutMs })
++      })
++      return {
++        structuredTurnStart:
++          delivery === 'accepted'
++            ? { verdict: 'observed' }
++            : {
++                verdict: 'unobserved',
++                reason:
++                  'The dispatch preamble was accepted, but the agent had not started to take it. It ' +
++                  'is delivered when the agent starts; if the worker then reports, this Dispatch ' +
++                  'settles normally.'
++              }
++      }
++    }
++    // A shell back at its prompt also reads as ready, so the brief needs the agent found in front.
++    const briefGuard = createWorkerBriefWriteGuard(
+       runtime,
+-      handle: terminalHandle,
+-      ...(briefGuard ? { beforeWrite: briefGuard.beforeWrite } : {}),
+-      turn: { purpose: 'dispatch-preamble', body: preamble, operationId: args.requestId }
+-    })
+-    return { prompt: sent.prompt }
+-  } finally {
+-    briefGuard?.dispose()
+-  }
++      args.launchedAgent,
++      !!args.launchedAgent
++    )
++    try {
++      const sent = await sendAgentTurn({
++        kind: 'terminal',
++        runtime,
++        handle: terminalHandle,
++        ...(managed ? { signal: managed.signal } : {}),
++        beforeWrite: async (ptyId) => {
++          await briefGuard?.beforeWrite(ptyId)
++          managed?.assertCurrent()
++        },
++        turn: { purpose: 'dispatch-preamble', body: preamble, operationId: args.requestId }
++      })
++      return { prompt: sent.prompt }
++    } finally {
++      briefGuard?.dispose()
++    }
++  })
+ }
+ 
+ function chatTaskTurnStart(delivery: ChatTaskDelivery): WorkerTurnStartObservation {
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start-dispatch.ts b/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start-dispatch.ts
+index 9fef87be..0ccd230a 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start-dispatch.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start-dispatch.ts
+@@ -1,3 +1,4 @@
++import { fenceManagedRun } from '../../../../orchestration/managed-run'
+ import type { TuiAgent } from '../../../../../../shared/tui-agent'
+ import type { WorkerStartModeReceipt } from '../../orchestration-worker-start-mode'
+ import type { OrchestrationWorkerLaunchReceipt } from './worker-launch-preferences'
+@@ -6,7 +7,7 @@ import type { RunRow } from '../../../../orchestration/types'
+ import type { startLocalWorker } from './local-worker-start'
+ import { resolveDispatchCreator } from '../runs/dispatch-creator'
+ 
+-export function createLocalWorkerStartDispatch(
++export async function createLocalWorkerStartDispatch(
+   {
+     runtime,
+     db,
+@@ -40,6 +41,15 @@ export function createLocalWorkerStartDispatch(
+     launchReceipt: OrchestrationWorkerLaunchReceipt
+   }
+ ) {
++  if (
++    (params.terminal || followUp) &&
++    db.db.prepare('SELECT 1 FROM managed_runs WHERE run_id = ?').get(run.id)
++  ) {
++    throw new Error(
++      'Managed execution requires a fresh worker; reconcile domain continuation first'
++    )
++  }
++  const managedIntent = await fenceManagedRun(db, run.id, 'start', params.retryOf ?? followUp?.of)
+   const startOptions = {
+     worktree: requestedWorktree,
+     mode,
+@@ -59,6 +69,7 @@ export function createLocalWorkerStartDispatch(
+       : 'existing_worktree'
+   }
+   return db.createStartingWorkerDispatch({
++    managedIntent,
+     creator: resolveDispatchCreator(runtime, params.from, callerSession),
+     maxDepth: runtime.getNestedWorkerMaxDepth(),
+     requiredCreatorDispatchId: helperCreator?.id,
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start.ts b/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start.ts
+index 814b96ed..ef558ad7 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/local-worker-start.ts
+@@ -139,7 +139,7 @@ export async function startLocalWorker(args: {
+   let mode = chatWorkerMode(await hostMode, chat)
+ 
+   const run = args.bindRun()
+-  const started = createLocalWorkerStartDispatch(args, {
++  const started = await createLocalWorkerStartDispatch(args, {
+     params,
+     run,
+     requestedWorktree,
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/worker-stop.ts b/src/main/runtime/rpc/methods/orchestration/worker/worker-stop.ts
+index fd3bd25d..3bc1192a 100644
+--- a/src/main/runtime/rpc/methods/orchestration/worker/worker-stop.ts
++++ b/src/main/runtime/rpc/methods/orchestration/worker/worker-stop.ts
+@@ -1,9 +1,9 @@
++import { dedupeWorkerStop } from './worker-stop-flight'
+ import { OrchestrationError } from '../../../../orchestration/orchestration-error'
+ import { defineMethod } from '../../../core'
+ import { describeUnconfirmedAgentStop } from '../../../../../../shared/pty-liveness-verdict'
+ import { ORCHESTRATION_WORKER_STOP_VERDICT_RUNTIME_CAPABILITY } from '../../../../../../shared/protocol-version'
+ import type { RuntimeStatus } from '../../../../../../shared/runtime-types'
+-import type { OrcaRuntimeService } from '../../../../orca-runtime'
+ import { inspectWorkerTerminal, resolvePinnedFederatedServer } from './worker-observation'
+ import { refuseFederatedStopWhileKeptOpen } from './worker-keep-open'
+ import { archiveWorkerOutputBeforeStop } from './worker-stop-archive'
+@@ -247,32 +247,6 @@ export const ORCHESTRATION_WORKER_STOP_METHODS = [
+   })
+ ]
+ 
+-const activeStopByRuntime = new WeakMap<OrcaRuntimeService, Map<string, Promise<unknown>>>()
+-
+-/** Coalesce same-runtime stops so only one closes; beginWorkerStop admits this epoch only to recover a row stranded by a dead runtime. */
+-function dedupeWorkerStop(
+-  runtime: OrcaRuntimeService,
+-  dispatchId: string,
+-  stop: () => Promise<unknown>
+-): Promise<unknown> {
+-  let active = activeStopByRuntime.get(runtime)
+-  if (!active) {
+-    active = new Map()
+-    activeStopByRuntime.set(runtime, active)
+-  }
+-  const inFlight = active.get(dispatchId)
+-  if (inFlight) {
+-    return inFlight
+-  }
+-  const started: Promise<unknown> = stop().finally(() => {
+-    if (active.get(dispatchId) === started) {
+-      active.delete(dispatchId)
+-    }
+-  })
+-  active.set(dispatchId, started)
+-  return started
+-}
+-
+ type RemoteStopReceipt = {
+   state: string
+   alreadySettled: boolean
+diff --git a/src/main/runtime/rpc/methods/structured-agent-session.ts b/src/main/runtime/rpc/methods/structured-agent-session.ts
+index 876a0b15..5d03d11a 100644
+--- a/src/main/runtime/rpc/methods/structured-agent-session.ts
++++ b/src/main/runtime/rpc/methods/structured-agent-session.ts
+@@ -1,3 +1,4 @@
++import { InputStreamRequest } from '../../../../shared/rpc-contract/agent-session-input-stream-params'
+ import { STRUCTURED_AGENT_SESSION_USAGE_LIMIT_CONTINUE_METHODS } from './structured-agent-session-usage-limit-continue'
+ import { STRUCTURED_AGENT_SESSION_CLOSE_METHOD } from './structured-agent-session-close-method'
+ import { clientRequestsCommands } from './structured-agent-session-policy'
+@@ -74,6 +75,13 @@ import { ORCA_LAYOUT_OWNER_IS_MAIN } from '../../../../shared/layout-owner-switc
+ import { refusingStructuredAgentSessionCreatesClosedFirst } from './structured-agent-session-close-before-create'
+ 
+ export const STRUCTURED_AGENT_SESSION_METHODS = [
++  defineMethod({
++    name: 'agentSession.inputStream',
++    permission: 'workspace',
++    params: InputStreamRequest,
++    handler: async (params, ctx) =>
++      (await requireInstalledHost(ctx, params.sessionId)).inputStream(params)
++  }),
+   defineMethod({
+     name: 'agentSession.rewind',
+     permission: 'workspace',
+diff --git a/src/main/runtime/runtime-terminal-writer.test.ts b/src/main/runtime/runtime-terminal-writer.test.ts
+index 29bbe50a..4c9b10e4 100644
+--- a/src/main/runtime/runtime-terminal-writer.test.ts
++++ b/src/main/runtime/runtime-terminal-writer.test.ts
+@@ -272,3 +272,15 @@ describe('submit settle before Enter', () => {
+     expect(writes).toEqual(['ls'])
+   })
+ })
++
++
++it('refuses a write revoked while its asynchronous write guard was finishing', async () => {
++  const writes: string[] = []
++  const writer = new RuntimeTerminalWriter((_id, data) => {writes.push(data); return true})
++  const controller = new AbortController()
++  await expect(writer.writeAction('pty', {text: 'obsolete task'}, '', {
++    inputKind: 'orchestration', signal: controller.signal,
++    beforeWrite: async () => {queueMicrotask(() => controller.abort())}
++  })).rejects.toThrow('request_aborted')
++  expect(writes).toEqual([])
++})
+diff --git a/src/main/runtime/runtime-terminal-writer.ts b/src/main/runtime/runtime-terminal-writer.ts
+index 8b93e235..e2da62b3 100644
+--- a/src/main/runtime/runtime-terminal-writer.ts
++++ b/src/main/runtime/runtime-terminal-writer.ts
+@@ -158,6 +158,7 @@ export class RuntimeTerminalWriter {
+     data: string,
+     options: RuntimeTerminalWriteOptions
+   ): Promise<WriteSettlement | undefined> {
++    if (options.signal?.aborted) throw new Error('request_aborted')
+     if (!options.requireWriteSettlement) {
+       if (!this.write(ptyId, data, options.inputKind)) {
+         throw new Error(options.suffixFailureError ?? 'terminal_not_writable')
+diff --git a/src/main/runtime/structured-agent-launch-composition.ts b/src/main/runtime/structured-agent-launch-composition.ts
+index addca59f..400d79bc 100644
+--- a/src/main/runtime/structured-agent-launch-composition.ts
++++ b/src/main/runtime/structured-agent-launch-composition.ts
+@@ -24,6 +24,7 @@ export type StructuredAgentLaunchSources = {
+     'selectWritableRecord' | 'requireWritableRecord' | 'pinLaunchDirectory'
+   >
+   resolveWorkspacePath: (workspaceId: string) => Promise<string>
++  admitManagedProcess?: (sessionId: string, spawnToken: string) => Promise<void>
+   resolveBaseEnvironment: () => Promise<Record<string, string>>
+   /** The base environment with the user's overlay for `agent` laid over it. */
+   resolveAgentEnvironment: (agent: string) => Promise<Record<string, string>>
+@@ -184,6 +185,7 @@ export function composeStructuredLaunch<L>(
+       permissionMode
+     )
+     admittedRecord(definition, sources.store, identity.sessionId)
++    await sources.admitManagedProcess?.(identity.sessionId, spawnToken)
+     const child = sealStructuredSessionChild({
+       sessionId: identity.sessionId,
+       spawnToken,
+@@ -226,6 +228,7 @@ export function structuredAgentLaunchSources(
+   return {
+     store: context.store,
+     resolveWorkspacePath: deps.resolveWorkspacePath,
++    ...(deps.admitManagedProcess ? { admitManagedProcess: deps.admitManagedProcess } : {}),
+     resolveBaseEnvironment: context.environment.resolveBaseEnvironment,
+     resolveAgentEnvironment: context.environment.resolveAgentEnvironment,
+     refreshAfterMissingProgram: context.environment.refreshAfterMissingProgram,
+diff --git a/src/main/runtime/structured-agent-session-runtime-contract.ts b/src/main/runtime/structured-agent-session-runtime-contract.ts
+index 7d8d51a1..39735624 100644
+--- a/src/main/runtime/structured-agent-session-runtime-contract.ts
++++ b/src/main/runtime/structured-agent-session-runtime-contract.ts
+@@ -25,6 +25,7 @@ export type StructuredAgentSessionRuntimeDeps = StructuredAgentSessionTransportO
+   /** Key id this host's claims are minted under. */
+   claimKeyId: string
+   resolveWorkspacePath: (workspaceId: string) => Promise<string>
++  admitManagedProcess?: (sessionId: string, spawnToken: string) => Promise<void>
+   resolveCodexCommand?: (options?: {
+     pathEnv?: string | null
+     homePath?: string
+diff --git a/src/main/runtime/structured-session-child-env.test.ts b/src/main/runtime/structured-session-child-env.test.ts
+index ca65cf9b..41407188 100644
+--- a/src/main/runtime/structured-session-child-env.test.ts
++++ b/src/main/runtime/structured-session-child-env.test.ts
+@@ -70,6 +70,7 @@ describe('sealStructuredSessionChild identity', () => {
+     expect(env).toEqual({
+       PATH: `${SHIM_DIR}:/usr/bin`,
+       ORCA_AGENT_SESSION_ID: SESSION_ID,
++      ORCA_WORKER_PROOF: expect.stringMatching(/^[a-f0-9]{64}$/),
+       // For a CLI that predates the id, which refuses on it instead of guessing a sibling.
+       ORCA_STRUCTURED_SESSION: '1',
+       ORCA_CLI_COMMAND: join(SHIM_DIR, 'orca'),
+diff --git a/src/main/runtime/structured-session-child-env.ts b/src/main/runtime/structured-session-child-env.ts
+index db91e992..a2db2987 100644
+--- a/src/main/runtime/structured-session-child-env.ts
++++ b/src/main/runtime/structured-session-child-env.ts
+@@ -1,3 +1,4 @@
++import { createHash } from 'node:crypto'
+ /** Name children by stable Orca session id; provider ids rotate on clear. Reject cross-host claims; retain worker handles for non-orchestration surfaces.
+  * Pin the CLI by absolute launcher and user-data path because login shells can reorder PATH; older CLIs refuse the structured marker.
+  * Reuse the PTY CLI-path rule: Linux installs as orca-ide to avoid GNOME Orca (#7904). Never fall back to bare or inherited launchers.
+@@ -25,6 +26,7 @@ export const STRUCTURED_CHILD_ENV_TO_DELETE: readonly string[] = [
+   'ORCA_TAB_ID',
+   'ORCA_WORKTREE_ID',
+   'ORCA_AGENT_LAUNCH_TOKEN',
++  'ORCA_WORKER_PROOF',
+   ORCA_SCRUB_SAFE_PANE_ENV,
+   ORCA_SCRUB_SAFE_LAUNCH_ENV,
+   ...AGENT_HOOK_RUNTIME_ENV_KEYS
+@@ -51,6 +53,11 @@ export function sealStructuredSessionChild(input: {
+     ? withCliRuntimeOnPath(input.cliRuntimeCommand, input.env, { platform: process.platform })
+     : input.env
+   const identity = childIdentity(input.sessionId, paired)
++  const proof = createHash('sha256')
++    .update(`osa-worker-v1:${input.sessionId}:${input.spawnToken}`)
++    .digest('hex')
++  identity.env.ORCA_WORKER_PROOF = proof
++  identity.commandEnv.ORCA_WORKER_PROOF = proof
+   const named = new Set([...Object.keys(identity.commandEnv), ORCA_AGENT_SESSION_SPAWN_TOKEN_ENV])
+   return {
+     env: { ...identity.env, [ORCA_AGENT_SESSION_SPAWN_TOKEN_ENV]: input.spawnToken },
+diff --git a/src/main/runtime/workspaces/workspace-process-listing-dependencies.ts b/src/main/runtime/workspaces/workspace-process-listing-dependencies.ts
+index de7a2eb0..e8ca0126 100644
+--- a/src/main/runtime/workspaces/workspace-process-listing-dependencies.ts
++++ b/src/main/runtime/workspaces/workspace-process-listing-dependencies.ts
+@@ -1,3 +1,5 @@
++import { admitManagedProcess } from '../orchestration/managed-run'
++import { resolveStructuredWorkerIdentityForSession } from '../structured-worker-authority'
+ import { resolveTuiAgentLaunchEnv } from '../../../shared/tui-agent-launch-defaults'
+ import type { GlobalSettings } from '../../../shared/global-settings-types'
+ import type { StructuredAgentId } from '../../../shared/agent-session/lifecycle/agent-session-provider-handle'
+@@ -15,6 +17,15 @@ import type { StructuredAgentSessionRequestFailure } from '../../native-chat/age
+ import type { StructuredAgentSessionHostDeps } from '../../native-chat/agent-session-wire/structured-agent-session-host-types'
+ 
+ export abstract class OrcaRuntimeWithWorktreePsDependencies extends OrcaRuntimeWithStartTuiIdleVisibleReadProbe {
++  protected admitManagedSessionProcess = async (
++    sessionId: string,
++    spawnToken: string
++  ): Promise<void> => {
++    const db = this.getOrchestrationDb()
++    const identity = resolveStructuredWorkerIdentityForSession(sessionId, db)
++    await admitManagedProcess(db, identity?.handle ?? '', sessionId, spawnToken)
++  }
++
+   /** Apply the host-owning desktop's account overlay to configured agent environment. */
+   protected structuredAgentLaunchEnv(
+     agent: StructuredAgentId,
+diff --git a/src/main/runtime/workspaces/workspace-process-listing.ts b/src/main/runtime/workspaces/workspace-process-listing.ts
+index 2f46f83e..c52a96c8 100644
+--- a/src/main/runtime/workspaces/workspace-process-listing.ts
++++ b/src/main/runtime/workspaces/workspace-process-listing.ts
+@@ -298,6 +298,7 @@ export abstract class OrcaRuntimeWithGetWorktreePs extends OrcaRuntimeWithWorktr
+       queuedAgentMessageOwed: (sessionId, from, peek) =>
+         this.structuredChatMailOwed(sessionId, from, peek),
+       assertNoTerminalWriter: (record) => this.assertStructuredChatAcquireAdmissible(record),
++      admitManagedProcess: this.admitManagedSessionProcess,
+       attentionDelivery: createStructuredAttentionMobileDelivery({
+         readNotificationSettings: () => this.requireStore().getSettings().notifications,
+         readWorkspaceLabels: (scope) =>
+diff --git a/src/shared/rpc-contract/rpc-params-catalog.generated.ts b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+index c4b3da73..70f72f98 100644
+--- a/src/shared/rpc-contract/rpc-params-catalog.generated.ts
++++ b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+@@ -75,6 +75,7 @@ import {
+   AttachmentUploadStartParams
+ } from './agent-session-attachment-params'
+ import { CurrentRequestsParams } from './agent-session-current-requests-params'
++import { InputStreamRequest } from './agent-session-input-stream-params'
+ import { CreateAgentSessionParams, EnsureAgentSessionParams } from './agent-session-params'
+ import { ReadVisualParams } from './agent-session-visual-params'
+ import {
+@@ -474,6 +475,14 @@ import {
+   RunParams,
+   RunStopParams
+ } from './orchestration-gates-params'
++import {
++  ManagedReportsParams,
++  ManagedRunParams,
++  ReliabilityCapabilitiesParams,
++  WorkerAttestParams,
++  WorkerReportParams,
++  WorkerReportReceiptParams
++} from './orchestration-managed-params'
+ import {
+   AskParams,
+   CheckParams,
+@@ -797,6 +806,7 @@ export const RPC_PARAMS_BY_METHOD = {
+   'agentSession.handoffStatus': HandoffStatusParams,
+   'agentSession.history': HistoryParams,
+   'agentSession.hold': HoldParams,
++  'agentSession.inputStream': InputStreamRequest,
+   'agentSession.item': ItemParams,
+   'agentSession.modelCatalog': ModelCatalogParams,
+   'agentSession.options': OptionsParams,
+@@ -1283,6 +1293,7 @@ export const RPC_PARAMS_BY_METHOD = {
+   'orcad.migration.stageSnapshotChunk': OrcadMigrationSnapshotChunkRequestSchema,
+   'orcad.terminalCensus': OrcadTerminalCensusParamsSchema,
+   'orchestration.ask': AskParams,
++  'orchestration.attestWorker': WorkerAttestParams,
+   'orchestration.callerShow': null,
+   'orchestration.check': CheckParams,
+   'orchestration.crewSubscribe': CrewSubscribeParams,
+@@ -1303,8 +1314,11 @@ export const RPC_PARAMS_BY_METHOD = {
+   'orchestration.gateList': GateListParams,
+   'orchestration.gateResolve': GateResolveParams,
+   'orchestration.inbox': InboxParams,
++  'orchestration.managedReports': ManagedReportsParams,
++  'orchestration.managedRun': ManagedRunParams,
+   'orchestration.partyLocation': PartyLocationParams,
+   'orchestration.partyOpen': PartyLocationParams,
++  'orchestration.reliabilityCapabilities': ReliabilityCapabilitiesParams,
+   'orchestration.reply': ReplyParams,
+   'orchestration.requestShow': RequestShowParams,
+   'orchestration.reset': ResetParams,
+@@ -1325,6 +1339,8 @@ export const RPC_PARAMS_BY_METHOD = {
+   'orchestration.workerList': WorkerListParams,
+   'orchestration.workerRead': WorkerReadParams,
+   'orchestration.workerRelease': WorkerDispatchParamsOfOrchestrationWorkerReleaseSchemasParams,
++  'orchestration.workerReport': WorkerReportParams,
++  'orchestration.workerReportReceipt': WorkerReportReceiptParams,
+   'orchestration.workerRetain': WorkerRetainParams,
+   'orchestration.workerShow': WorkerDispatchParams,
+   'orchestration.workerStart': WorkerStartParams,
+diff --git a/src/main/native-chat/agent-session-journal/journal-input-stream.test.ts b/src/main/native-chat/agent-session-journal/journal-input-stream.test.ts
+new file mode 100644
+index 00000000..f8e238a6
+--- /dev/null
++++ b/src/main/native-chat/agent-session-journal/journal-input-stream.test.ts
+@@ -0,0 +1,137 @@
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, expect, it } from 'vitest'
++import { JournalHostDatabase } from './journal-host-database'
++import { captureJournalInputs, useInputStream } from './journal-input-stream'
++import { runWithActiveRpcCaller } from '../../runtime/rpc/rpc-active-caller'
++import { JournalRowWriter } from './journal-row-writer'
++import { JournalWriteQueue } from './journal-write-queue'
++import type { JournalRow } from './journal-row-schema'
++
++const cleanups: (() => Promise<void>)[] = []
++afterEach(async () => {
++  for (const cleanup of cleanups.splice(0)) {
++    await cleanup()
++  }
++})
++function setup() {
++  const directory = mkdtempSync(join(tmpdir(), 'orca-input-stream-'))
++  let host = JournalHostDatabase.open(directory)
++  cleanups.push(async () => {
++    await host.close()
++    rmSync(directory, { recursive: true, force: true })
++  })
++  const input = { sessionId: 'chat', consumer: 'consumer-secret-with-more-than-32-chars' }
++  const registered = host.transaction((db) => useInputStream(db, { ...input, action: 'register' }))
++  const streamId = String(registered.streamId)
++  const call = (action: 'read' | 'ack' | 'barrier', cursor?: number) =>
++    host.transaction((db) => useInputStream(db, { ...input, streamId, action, cursor }))
++  return {
++    input,
++    streamId,
++    call,
++    get host() {
++      return host
++    },
++    async restart() {
++      await host.close()
++      host = JournalHostDatabase.open(directory)
++    }
++  }
++}
++function row(seq: number): JournalRow {
++  return {
++    kind: 'submission',
++    v: 1,
++    epoch: 'render-epoch',
++    seq,
++    ts: 1,
++    fence: 0,
++    clientMessageId: `message-${seq}`,
++    payloadFingerprint: 'hash',
++    providerHandle: { kind: 'codex', threadId: 'provider' },
++    origin: 'client',
++    source: { kind: 'user' },
++    body: { kind: 'message', role: 'user', blocks: [{ type: 'text', text: 'do the work' }] }
++  }
++}
++it('retains ordered inputs across render deletion and restart, while CLI user role is automation', async () => {
++  const f = setup()
++  runWithActiveRpcCaller({ kind: 'desktop' }, () =>
++    f.host.transaction((db) => captureJournalInputs(db, 'chat', [row(1)]))
++  )
++  runWithActiveRpcCaller({ kind: 'local-cli' }, () =>
++    f.host.transaction((db) => captureJournalInputs(db, 'chat', [row(2)]))
++  )
++  f.host.transaction((db) =>
++    db.prepare('DELETE FROM journal_rows WHERE session_id = ?').run('chat')
++  )
++  await f.restart()
++  const page = f.call('read', 0)
++  expect('events' in page && page.events?.map((event) => event.source)).toEqual([
++    'human',
++    'automation'
++  ])
++  expect(page.cursor).toBe(2)
++  f.call('ack', 2)
++  expect(() => f.call('read', 0)).toThrow('gap')
++  expect('events' in f.call('read', 2)).toBe(true)
++})
++it('commits event and submission together, with barriers on the same write lane', async () => {
++  const f = setup(),
++    queue = new JournalWriteQueue('chat')
++  let next = 1
++  const writer = new JournalRowWriter({
++    sessionId: 'chat',
++    now: () => 1,
++    serialize: (run) => queue.serialize(run),
++    database: () => f.host,
++    readOnly: () => false,
++    highestFence: () => 0,
++    nextSequence: () => next,
++    commit: (rows) => {
++      next += rows.length
++    }
++  })
++  await expect(
++    writer.enqueue(() => row(1), {
++      write: () => {
++        throw new Error('injected crash')
++      },
++      committed: () => {}
++    })
++  ).rejects.toThrow('injected crash')
++  expect(f.call('read', 0).cursor).toBe(0)
++  await runWithActiveRpcCaller({ kind: 'paired-device', deviceId: 'phone' }, () =>
++    writer.enqueue(() => row(1))
++  )
++  const barrier = await queue.readInOrder(() => f.call('barrier'))
++  await writer.enqueue(() => row(2))
++  expect(barrier.cursor).toBe(2)
++  const origins = f.call('read', 0)
++  expect('events' in origins && origins.events?.[0].source).toBe('unknown')
++  const page = f.call('read', 0)
++  expect('events' in page && page.events?.map((event) => event.kind)).toEqual([
++    'submission',
++    'barrier',
++    'submission'
++  ])
++})
++it('refuses ack before delivery, a different consumer and full retention without dropping input', () => {
++  const f = setup()
++  f.host.transaction((db) => captureJournalInputs(db, 'chat', [row(1)]))
++  expect(() => f.call('ack', 1)).toThrow('ahead_of_delivery')
++  expect(() =>
++    f.host.transaction((db) =>
++      useInputStream(db, { ...f.input, consumer: 'wrong', action: 'register' })
++    )
++  ).toThrow('consumer_mismatch')
++  f.host.db
++    .prepare('UPDATE journal_input_streams SET head = 10000 WHERE session_id = ?')
++    .run('chat')
++  expect(() => f.host.transaction((db) => captureJournalInputs(db, 'chat', [row(2)]))).toThrow(
++    'input_stream_full'
++  )
++  expect(f.host.db.prepare('SELECT COUNT(*) AS n FROM journal_input_events').get()?.n).toBe(1)
++})
+diff --git a/src/main/native-chat/agent-session-journal/journal-input-stream.ts b/src/main/native-chat/agent-session-journal/journal-input-stream.ts
+new file mode 100644
+index 00000000..5e4cd561
+--- /dev/null
++++ b/src/main/native-chat/agent-session-journal/journal-input-stream.ts
+@@ -0,0 +1,154 @@
++import { createHash, randomUUID } from 'node:crypto'
++import type { z } from 'zod'
++import type Database from '../../sqlite/sync-database'
++import { getActiveRpcCaller } from '../../runtime/rpc/rpc-active-caller'
++import type { JournalRow } from './journal-row-schema'
++
++import type { InputStreamRequest } from '../../../shared/rpc-contract/agent-session-input-stream-params'
++
++export function createInputStreamTables(db: Database.Database): void {
++  db.exec(`CREATE TABLE IF NOT EXISTS journal_input_streams (
++    session_id TEXT PRIMARY KEY, id TEXT NOT NULL, consumer_hash TEXT NOT NULL,
++    head INTEGER NOT NULL DEFAULT 0, ack INTEGER NOT NULL DEFAULT 0,
++    delivered INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL);
++    CREATE TABLE IF NOT EXISTS journal_input_events (
++    session_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_json TEXT NOT NULL,
++    PRIMARY KEY(session_id, sequence));`)
++}
++
++/** Retain accepted input independently of render epochs, in the submission's FULL transaction. */
++export function captureJournalInputs(
++  db: Database.Database,
++  sessionId: string,
++  rows: readonly JournalRow[]
++): void {
++  if (!db.prepare('SELECT 1 FROM journal_input_streams WHERE session_id = ?').get(sessionId)) {
++    return
++  }
++  const caller = getActiveRpcCaller()
++  const source =
++    caller?.kind === 'desktop' ? 'human' : caller?.kind === 'local-cli' ? 'automation' : 'unknown'
++  for (const row of rows) {
++    if (row.kind === 'submission') {
++      appendInputEvent(db, sessionId, {
++        kind: 'submission',
++        messageId: row.queuedMessageId ?? row.clientMessageId,
++        source:
++          row.origin === 'client' && row.source?.kind === 'user' && !row.body.from
++            ? source
++            : 'automation',
++        body: row.body,
++        at: row.ts
++      })
++    } else if (row.kind === 'queue' && ['queued', 'edited', 'withdrawn'].includes(row.change.op)) {
++      appendInputEvent(db, sessionId, {
++        kind: row.change.op,
++        messageId: row.messageId,
++        source: 'body' in row.change && row.change.body.from ? 'automation' : source,
++        change: row.change,
++        at: row.ts
++      })
++    } else if (row.kind === 'tombstone' && row.stopEvent) {
++      appendInputEvent(db, sessionId, { kind: 'stop', source, stop: row.stopEvent, at: row.ts })
++    }
++  }
++}
++
++function appendInputEvent(db: Database.Database, sessionId: string, event: object): number {
++  const stream = db
++    .prepare('SELECT id, head, ack FROM journal_input_streams WHERE session_id = ?')
++    .get(sessionId)
++  if (!stream) {
++    throw new Error('input_stream_not_registered')
++  }
++  // shortcut: retention is capped at 10,000 rows; use a transactional byte counter if that bound grows.
++  const bytes = db
++    .prepare(
++      'SELECT COALESCE(SUM(length(CAST(event_json AS BLOB))), 0) AS bytes FROM journal_input_events WHERE session_id = ?'
++    )
++    .get(sessionId)
++  const sequence = Number(stream.head) + 1
++  const body = JSON.stringify({ ...event, id: `${stream.id}:${sequence}`, sequence })
++  if (
++    Number(stream.head) - Number(stream.ack) >= 10000 ||
++    Number(bytes?.bytes) + Buffer.byteLength(body) > 32 * 1024 * 1024
++  ) {
++    throw new Error(
++      'input_stream_full: consumer must acknowledge retained input before another submission'
++    )
++  }
++  db.prepare('INSERT INTO journal_input_events VALUES (?, ?, ?)').run(sessionId, sequence, body)
++  db.prepare('UPDATE journal_input_streams SET head = ? WHERE session_id = ?').run(
++    sequence,
++    sessionId
++  )
++  return sequence
++}
++
++/** Called on the journal write lane in a FULL host database transaction. */
++export function useInputStream(db: Database.Database, input: z.infer<typeof InputStreamRequest>) {
++  const { sessionId, action } = input
++  const hash = createHash('sha256').update(input.consumer).digest('hex')
++  let stream = db.prepare('SELECT * FROM journal_input_streams WHERE session_id = ?').get(sessionId)
++  if (!stream && action === 'register') {
++    db.prepare(
++      'INSERT INTO journal_input_streams(session_id, id, consumer_hash, started_at) VALUES (?, ?, ?, ?)'
++    ).run(sessionId, randomUUID(), hash, Date.now())
++    stream = db.prepare('SELECT * FROM journal_input_streams WHERE session_id = ?').get(sessionId)
++  }
++  if (!stream || stream.consumer_hash !== hash) {
++    throw new Error('input_stream_consumer_mismatch')
++  }
++  if (action !== 'register' && input.streamId !== stream.id) {
++    throw new Error('input_stream_gap: stream identity changed')
++  }
++  if (action === 'barrier') {
++    const cursor = appendInputEvent(db, sessionId, { kind: 'barrier', at: Date.now() })
++    return { streamId: stream.id, cursor }
++  }
++  const cursor = input.cursor ?? Number(stream.ack)
++  if (cursor < Number(stream.ack) || cursor > Number(stream.head)) {
++    throw new Error('input_stream_gap: cursor outside retained interval')
++  }
++  if (action === 'ack') {
++    if (cursor > Number(stream.delivered)) {
++      throw new Error('input_stream_ack_ahead_of_delivery')
++    }
++    db.prepare('UPDATE journal_input_streams SET ack = ? WHERE session_id = ?').run(
++      cursor,
++      sessionId
++    )
++    db.prepare('DELETE FROM journal_input_events WHERE session_id = ? AND sequence <= ?').run(
++      sessionId,
++      cursor
++    )
++  }
++  const events =
++    action === 'read'
++      ? db
++          .prepare(
++            'SELECT sequence, event_json FROM journal_input_events WHERE session_id = ? AND sequence > ? ORDER BY sequence LIMIT 100'
++          )
++          .all(sessionId, cursor)
++      : []
++  const end = events.length ? Number(events.at(-1)?.sequence) : cursor
++  if (action === 'read') {
++    if (
++      (events.length && Number(events[0].sequence) !== cursor + 1) ||
++      (!events.length && cursor !== Number(stream.head))
++    ) {
++      throw new Error('input_stream_gap: retained event missing')
++    }
++    db.prepare(
++      'UPDATE journal_input_streams SET delivered = MAX(delivered, ?) WHERE session_id = ?'
++    ).run(end, sessionId)
++  }
++  return {
++    streamId: stream.id,
++    startedAt: stream.started_at,
++    cursor: end,
++    head: stream.head,
++    acknowledged: action === 'ack' ? cursor : stream.ack,
++    events: events.map((row) => JSON.parse(String(row.event_json)))
++  }
++}
+diff --git a/src/main/native-chat/agent-session-wire/structured-agent-session-input-stream.test.ts b/src/main/native-chat/agent-session-wire/structured-agent-session-input-stream.test.ts
+new file mode 100644
+index 00000000..9be49564
+--- /dev/null
++++ b/src/main/native-chat/agent-session-wire/structured-agent-session-input-stream.test.ts
+@@ -0,0 +1,21 @@
++import { expect, it } from 'vitest'
++import { attach, hostTestState } from './structured-agent-session-host-test-harness'
++import { HOST_TEST_SESSION } from './structured-agent-session-host-test-data'
++
++it('opens a cold conversation before entering its journal lane, retaining the same input stream', async () => {
++  await attach()
++  const { host } = hostTestState()
++  const input = {
++    sessionId: HOST_TEST_SESSION,
++    consumer: 'consumer-secret-with-more-than-32-chars'
++  }
++  const registered = await host.inputStream({ ...input, action: 'register' })
++  await host.close(HOST_TEST_SESSION, 'evict')
++  expect(host.hasSession(HOST_TEST_SESSION)).toBe(false)
++  const barrier = await host.inputStream({
++    ...input,
++    streamId: String(registered.streamId),
++    action: 'barrier'
++  })
++  expect(barrier).toMatchObject({ streamId: registered.streamId, cursor: 1 })
++}, 3000)
+diff --git a/src/main/runtime/orchestration/managed-delivery.ts b/src/main/runtime/orchestration/managed-delivery.ts
+new file mode 100644
+index 00000000..57a1daad
+--- /dev/null
++++ b/src/main/runtime/orchestration/managed-delivery.ts
+@@ -0,0 +1,144 @@
++import type { OrchestrationDb } from './db'
++import { OrchestrationError } from './orchestration-error'
++import { requestManagedOwner } from './managed-owner-client'
++
++const aborts = new WeakMap<OrchestrationDb, Map<string, Set<AbortController>>>()
++const deliveries = new WeakMap<OrchestrationDb, Map<string, Promise<void>>>()
++export const MANAGED_CONTROL_SCHEMA = `
++CREATE TABLE IF NOT EXISTS managed_controls (
++ run_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL DEFAULT 0, stop_pending INTEGER NOT NULL DEFAULT 0,
++ permit_id TEXT, permit_sequence INTEGER);
++CREATE TABLE IF NOT EXISTS managed_deliveries (
++ dispatch_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL, state TEXT NOT NULL, receipt TEXT);
++`
++export function managedControl(db: OrchestrationDb, runId: string) {
++  db.db.prepare('INSERT OR IGNORE INTO managed_controls(run_id) VALUES (?)').run(runId)
++  return db.db.prepare('SELECT * FROM managed_controls WHERE run_id = ?').get(runId)!
++}
++export function revokeManagedPermit(db: OrchestrationDb, runId: string, stopping: boolean): void {
++  managedControl(db, runId)
++  db.db
++    .prepare(
++      'UPDATE managed_controls SET sequence = sequence + 1, permit_id = NULL, stop_pending = CASE WHEN ? THEN sequence + 1 ELSE stop_pending END WHERE run_id = ?'
++    )
++    .run(stopping ? 1 : 0, runId)
++  for (const controller of aborts.get(db)?.get(runId) ?? []) {
++    controller.abort()
++  }
++  if (stopping) {
++    db.db.prepare('UPDATE managed_runs SET closed = 1 WHERE run_id = ?').run(runId)
++  }
++}
++export async function drainManagedDelivery(db: OrchestrationDb, runId: string): Promise<void> {
++  await deliveries.get(db)?.get(runId)
++}
++
++/** Control changes register first, then wait for this transport boundary before claiming effect. */
++export async function deliverManaged<T>(
++  db: OrchestrationDb,
++  runId: string,
++  dispatchId: string,
++  send: (
++    taskSpec?: string,
++    guard?: { signal: AbortSignal; assertCurrent: () => void }
++  ) => Promise<T>
++): Promise<T> {
++  if (!db.db.prepare('SELECT 1 FROM managed_runs WHERE run_id = ?').get(runId)) {
++    return send()
++  }
++  let lanes = deliveries.get(db)
++  if (!lanes) {
++    lanes = new Map()
++    deliveries.set(db, lanes)
++  }
++  const previous = lanes.get(runId)
++  let release!: () => void
++  const active = new Promise<void>((resolve) => {
++    release = resolve
++  })
++  lanes.set(runId, active)
++  await previous
++  const controller = new AbortController()
++  let runs = aborts.get(db)
++  if (!runs) {
++    runs = new Map()
++    aborts.set(db, runs)
++  }
++  const controllers = runs.get(runId) ?? new Set<AbortController>()
++  controllers.add(controller)
++  runs.set(runId, controllers)
++  try {
++    const owner = db.db.prepare('SELECT * FROM managed_runs WHERE run_id = ?').get(runId)!
++    const control = managedControl(db, runId)
++    const intent = db.db
++      .prepare('SELECT id FROM managed_intents WHERE consumed_by = ?')
++      .get(dispatchId)
++    const assertCurrent = () => {
++      controller.signal.throwIfAborted()
++      const current = db.db.prepare('SELECT * FROM managed_runs WHERE run_id = ?').get(runId)
++      const now = managedControl(db, runId)
++      if (
++        !current ||
++        current.closed ||
++        current.dispatch_id !== dispatchId ||
++        current.generation !== owner.generation ||
++        now.stop_pending ||
++        now.sequence !== control.sequence ||
++        now.permit_id !== intent?.id
++      ) {
++        throw new OrchestrationError(
++          'managed_delivery_revoked',
++          'Managed task delivery was revoked before transport acceptance.'
++        )
++      }
++    }
++    assertCurrent()
++    const prior = db.db
++      .prepare('SELECT * FROM managed_deliveries WHERE dispatch_id = ?')
++      .get(dispatchId)
++    if (prior?.state === 'accepted') {
++      return JSON.parse(String(prior.receipt))
++    }
++    if (prior?.state === 'submitting') {
++      throw new OrchestrationError(
++        'operation_unknown',
++        'Managed task delivery may have reached its process; reconcile the original operation before recovery.'
++      )
++    }
++    const admission = await requestManagedOwner(String(owner.endpoint), {
++      id: `deliver:${dispatchId}`,
++      command: ['native', 'activate'],
++      options: {
++        token: String(owner.token),
++        assignment: String(owner.owner),
++        run: runId,
++        intent: String(intent?.id),
++        dispatch: dispatchId,
++        generation: String(owner.generation)
++      }
++    })
++    assertCurrent()
++    if (admission.generation !== owner.generation || !admission.taskSpec) {
++      throw new Error('managed_delivery_requires_current_task_spec')
++    }
++    db.db
++      .prepare("INSERT OR REPLACE INTO managed_deliveries VALUES (?, ?, 'submitting', NULL)")
++      .run(dispatchId, control.sequence)
++    const receipt = await send(admission.taskSpec, { signal: controller.signal, assertCurrent })
++    db.db
++      .prepare(
++        "UPDATE managed_deliveries SET state = 'accepted', receipt = ? WHERE dispatch_id = ?"
++      )
++      .run(JSON.stringify(receipt), dispatchId)
++    return receipt
++  } finally {
++    controllers.delete(controller)
++    if (!controllers.size) {
++      runs.delete(runId)
++    }
++    release()
++    if (lanes.get(runId) === active) {
++      lanes.delete(runId)
++    }
++  }
++}
+diff --git a/src/main/runtime/orchestration/managed-owner-client.ts b/src/main/runtime/orchestration/managed-owner-client.ts
+new file mode 100644
+index 00000000..4c3d36e0
+--- /dev/null
++++ b/src/main/runtime/orchestration/managed-owner-client.ts
+@@ -0,0 +1,56 @@
++import { connect } from 'node:net'
++
++export function requestManagedOwner(
++  endpoint: string,
++  request: object
++): Promise<{ generation: number; taskSpec?: string }> {
++  return new Promise((resolve, reject) => {
++    const socket = connect(endpoint)
++    let data = ''
++    socket.setEncoding('utf8')
++    socket.setTimeout(45000, () => socket.destroy(new Error('managed_owner_unavailable')))
++    socket.on('error', reject)
++    socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`))
++    socket.on('data', (chunk) => {
++      data += chunk
++      if (data.length > 64000) {
++        socket.destroy(new Error('managed_owner_reply_too_large'))
++        return
++      }
++      if (!data.includes('\n')) {
++        return
++      }
++      socket.end()
++      try {
++        const answer: unknown = JSON.parse(data.slice(0, data.indexOf('\n')))
++        if (
++          !answer ||
++          typeof answer !== 'object' ||
++          !('ok' in answer) ||
++          answer.ok !== true ||
++          !('result' in answer) ||
++          !answer.result ||
++          typeof answer.result !== 'object' ||
++          !('generation' in answer.result) ||
++          typeof answer.result.generation !== 'number' ||
++          (!Number.isSafeInteger(answer.result.generation) || answer.result.generation < 1)
++        ) {
++          throw new Error('managed_fence_refused')
++        }
++        resolve({
++          generation: answer.result.generation,
++          ...('taskSpec' in answer.result && typeof answer.result.taskSpec === 'string'
++            ? { taskSpec: answer.result.taskSpec }
++            : {})
++        })
++      } catch (error) {
++        reject(error)
++      }
++    })
++    socket.on('end', () => {
++      if (!data.includes('\n')) {
++        reject(new Error('managed_owner_reply_missing'))
++      }
++    })
++  })
++}
+diff --git a/src/main/runtime/orchestration/managed-run.test.ts b/src/main/runtime/orchestration/managed-run.test.ts
+new file mode 100644
+index 00000000..cdfc2b08
+--- /dev/null
++++ b/src/main/runtime/orchestration/managed-run.test.ts
+@@ -0,0 +1,368 @@
++import { dedupeWorkerStop } from '../rpc/methods/orchestration/worker/worker-stop-flight'
++import type { OrcaRuntimeService } from '../orca-runtime'
++import { deliverManaged, revokeManagedPermit, drainManagedDelivery } from './managed-delivery'
++import { createServer, type Server } from 'node:net'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, expect, test } from 'vitest'
++import { OrchestrationDb } from './db'
++import {
++  registerManagedRun,
++  fenceManagedRun,
++  assertManagedStop,
++  admitManagedProcess
++} from './managed-run'
++
++const cleanups: (() => Promise<void> | void)[] = []
++afterEach(async () => {
++  for (const close of cleanups.splice(0).toReversed()) {
++    await close()
++  }
++})
++async function fixture(beforeReply?: (request: { command?: string[] }) => Promise<void>) {
++  const dir = mkdtempSync(join(tmpdir(), 'orca-managed-'))
++  cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
++  let db = new OrchestrationDb(join(dir, 'db'))
++  cleanups.push(() => db.close())
++  const endpoint = join(dir, 'owner.sock')
++  let generation = 0
++  const replies = new Map<string, number>()
++  const requests: { id: string; options: { action: string } }[] = []
++  let server: Server | undefined = createServer((socket) => {
++    let data = ''
++    socket.on('data', async (chunk) => {
++      data += chunk.toString()
++      if (!data.includes('\n')) {
++        return
++      }
++      const request = JSON.parse(data)
++      requests.push(request)
++      await beforeReply?.(request)
++      if (!replies.has(request.id)) {
++        replies.set(
++          request.id,
++          request.command?.[1] === 'activate' ? Number(request.options.generation) : ++generation
++        )
++      }
++      socket.end(
++        `${JSON.stringify({ ok: true, result: { generation: replies.get(request.id), taskSpec: 'current owner scope' } })}\n`
++      )
++    })
++  })
++  await new Promise<void>((resolve) => server!.listen(endpoint, resolve))
++  const closeServer = async () => {
++    if (server) {
++      await new Promise<void>((resolve, reject) =>
++        server!.close((error) => (error ? reject(error) : resolve()))
++      )
++    }
++    server = undefined
++  }
++  cleanups.push(closeServer)
++  const runId = db.createRun({
++    objective: 'managed test',
++    coordinatorHandle: null,
++    coordinatorPaneKey: null
++  }).id
++  const owner = {
++    runId,
++    owner: 'osa',
++    token: 's'.repeat(32),
++    endpoint,
++    action: 'register' as const
++  }
++  const task = db.createTask({ runId, spec: 'managed work' })
++  registerManagedRun(db, owner)
++  const start = (managedIntent?: string, retryOf?: string) =>
++    db.createStartingWorkerDispatch({
++      creator: { kind: 'system' },
++      maxDepth: 10,
++      taskId: task.id,
++      startOptions: {},
++      managedIntent,
++      retryOf
++    }).dispatch
++  return {
++    get db() {
++      return db
++    },
++    task,
++    runId,
++    owner,
++    start,
++    requests,
++    closeServer,
++    restart() {
++      db.close()
++      db = new OrchestrationDb(join(dir, 'db'))
++    }
++  }
++}
++
++test('managed starts fail closed across restart and same Task retries retain the native circuit breaker', async () => {
++  const f = await fixture()
++  expect(() => f.start()).toThrow('requires_current_fence')
++  let previous: string | undefined
++  for (let n = 1; n <= 3; n++) {
++    const intent = await fenceManagedRun(f.db, f.runId, 'start', previous)
++    const dispatch = f.start(intent, previous)
++    expect(dispatch.task_id).toBe(f.task.id)
++    expect(registerManagedRun(f.db, { ...f.owner, action: 'status' })).toMatchObject({
++      generation: n,
++      dispatch_id: dispatch.id,
++      closed: 0
++    })
++    expect(() => f.start(intent, previous)).toThrow()
++    f.db.failWorkerStart(dispatch.id, 'agent_readiness', 'test startup failure')
++    previous = dispatch.id
++    f.restart()
++    expect(() => f.start(undefined, previous)).toThrow()
++  }
++  expect(f.db.getDispatchContextById(previous!)).toMatchObject({
++    failure_count: 3,
++    status: 'circuit_broken'
++  })
++  const intent = await fenceManagedRun(f.db, f.runId, 'start', previous)
++  expect(() => f.start(intent, previous)).toThrow('will not retry it again')
++  expect(f.db.db.prepare('SELECT COUNT(*) AS count FROM managed_dispatches').get()).toMatchObject({
++    count: 3
++  })
++})
++
++test('owner offline refuses startup; stop invalidates an unconsumed start grant', async () => {
++  const f = await fixture()
++  const intent = await fenceManagedRun(f.db, f.runId, 'start')
++  // A stop arriving after a start grant must invalidate it before any child is launched.
++  await fenceManagedRun(f.db, f.runId, 'stop')
++  expect(() => f.start(intent)).toThrow('requires_current_fence')
++  await f.closeServer()
++  await expect(fenceManagedRun(f.db, f.runId, 'start', 'wrong')).rejects.toThrow('predecessor')
++  // A second registered Run has no cached callback response to reuse.
++  f.db.db.prepare('DELETE FROM managed_intents').run()
++  await expect(fenceManagedRun(f.db, f.runId, 'start')).rejects.toThrow()
++  expect(() => f.start()).toThrow('requires_current_fence')
++})
++
++test('the persistent database fence protects direct Dispatch inserts and stop requires prior closure', async () => {
++  const f = await fixture()
++  const first = f.start(await fenceManagedRun(f.db, f.runId, 'start'))
++  expect(() => assertManagedStop(f.db.db, f.runId, first.id)).toThrow('requires_fence')
++  await fenceManagedRun(f.db, f.runId, 'stop', first.id)
++  expect(() => assertManagedStop(f.db.db, f.runId, first.id)).not.toThrow()
++  f.restart()
++  expect(() =>
++    f.db.db
++      .prepare('INSERT INTO dispatch_contexts(id, run_id) VALUES (?, ?)')
++      .run('bypass', f.runId)
++  ).toThrow('managed_dispatch_requires_fence')
++  expect(registerManagedRun(f.db, { ...f.owner, action: 'status' })).toMatchObject({ closed: 1 })
++})
++
++test('adoption preserves a single existing Task, closes its old authority, and never resets retry failures', async () => {
++  const f = await fixture()
++  const run = f.db.createRun({
++    objective: 'legacy OSA assignment',
++    coordinatorHandle: null,
++    coordinatorPaneKey: null
++  })
++  const task = f.db.createTask({ runId: run.id, spec: 'existing work' })
++  const old = f.db.createStartingWorkerDispatch({
++    creator: { kind: 'system' },
++    maxDepth: 10,
++    taskId: task.id,
++    startOptions: {}
++  }).dispatch
++  f.db.failWorkerStart(old.id, 'agent_readiness', 'pre-upgrade failure')
++  expect(() => registerManagedRun(f.db, { ...f.owner, runId: run.id })).toThrow('empty_run')
++  expect(() =>
++    registerManagedRun(f.db, { ...f.owner, runId: run.id, action: 'adopt', dispatchId: 'wrong' })
++  ).toThrow('identity_mismatch')
++  expect(
++    registerManagedRun(f.db, { ...f.owner, runId: run.id, action: 'adopt', dispatchId: old.id })
++  ).toMatchObject({ closed: 1, generation: 0, dispatch_id: old.id })
++  f.restart()
++  const managedIntent = await fenceManagedRun(f.db, run.id, 'start', old.id)
++  const next = f.db.createStartingWorkerDispatch({
++    creator: { kind: 'system' },
++    maxDepth: 10,
++    taskId: task.id,
++    startOptions: {},
++    retryOf: old.id,
++    managedIntent
++  }).dispatch
++  expect(next).toMatchObject({ task_id: task.id, failure_count: 1 })
++})
++
++test('REVIEW: stale managed start grant must recheck owner admission before reuse', async () => {
++  const f = await fixture()
++  const first = await fenceManagedRun(f.db, f.runId, 'start')
++  expect(f.requests).toHaveLength(1)
++  const second = await fenceManagedRun(f.db, f.runId, 'start')
++  expect(second).toBe(first)
++  expect(f.requests).toHaveLength(2)
++})
++
++test('REVIEW: managed session restart after failed dispatch cannot bypass fence', async () => {
++  const f = await fixture()
++  const dispatch = f.start(await fenceManagedRun(f.db, f.runId, 'start'))
++  const pane = 'tab_1:11111111-1111-4111-8111-111111111111'
++  f.db.prepareStartingWorkerAuthority({
++    dispatchId: dispatch.id,
++    handle: 'term_worker',
++    paneKey: pane,
++    processIncarnation: 'runtime:worker:1',
++    worktreeId: 'repo::same',
++    effects: [],
++    setupState: 'not_applicable'
++  })
++  await admitManagedProcess(f.db, 'term_worker', 'session-worker', 'first-token')
++  f.db.failWorkerStart(dispatch.id, 'agent_readiness', 'failed')
++  await expect(
++    admitManagedProcess(f.db, 'term_worker', 'session-worker', 'second-token')
++  ).rejects.toThrow()
++  await expect(admitManagedProcess(f.db, '', 'session-worker', 'third-token')).rejects.toThrow()
++})
++
++test('REVIEW CONTROL: active managed session accepts matching pin and fences changed token', async () => {
++  const f = await fixture(),
++    dispatch = f.start(await fenceManagedRun(f.db, f.runId, 'start'))
++  f.db.prepareStartingWorkerAuthority({
++    dispatchId: dispatch.id,
++    handle: 'term_worker',
++    paneKey: 'tab_1:11111111-1111-4111-8111-111111111111',
++    processIncarnation: 'runtime:worker:1',
++    worktreeId: 'repo::same',
++    effects: [],
++    setupState: 'not_applicable'
++  })
++  await admitManagedProcess(f.db, 'term_worker', 'session-worker', 'first-token')
++  await admitManagedProcess(f.db, 'term_worker', 'session-worker', 'first-token')
++  await expect(
++    admitManagedProcess(f.db, 'term_worker', 'session-worker', 'second-token')
++  ).rejects.toThrow('managed_process_restart_requires_task_retry')
++  expect(f.requests.at(-1)?.options.action).toBe('restart')
++})
++
++test('revocation during owner admission prevents an unconsumed start from creating a Dispatch', async () => {
++  let reached!: () => void, release!: () => void
++  const arrived = new Promise<void>((resolve) => {
++    reached = resolve
++  })
++  const hold = new Promise<void>((resolve) => {
++    release = resolve
++  })
++  const f = await fixture(async () => {
++    reached()
++    await hold
++  })
++  const pending = fenceManagedRun(f.db, f.runId, 'start')
++  await Promise.race([
++    arrived,
++    pending.then(() => {
++      throw new Error('transport was never entered')
++    })
++  ])
++  revokeManagedPermit(f.db, f.runId, false)
++  release()
++  await expect(pending).rejects.toThrow('control changed')
++  expect(() => f.start()).toThrow('requires_current_fence')
++})
++
++test('a control change between Dispatch creation and task delivery prevents the old task transport', async () => {
++  const f = await fixture(),
++    dispatch = f.start(await fenceManagedRun(f.db, f.runId, 'start'))
++  revokeManagedPermit(f.db, f.runId, false)
++  let sent = false
++  await expect(
++    deliverManaged(f.db, f.runId, dispatch.id, async () => {
++      sent = true
++    })
++  ).rejects.toThrow('revoked')
++  expect(sent).toBe(false)
++})
++
++test('a control change waits for already-entered transport and revokes subsequent deliveries', async () => {
++  const f = await fixture(),
++    dispatch = f.start(await fenceManagedRun(f.db, f.runId, 'start'))
++  let reached!: () => void, release!: () => void
++  const arrived = new Promise<void>((resolve) => {
++      reached = resolve
++    }),
++    hold = new Promise<void>((resolve) => {
++      release = resolve
++    })
++  const delivery = deliverManaged(f.db, f.runId, dispatch.id, async (spec) => {
++    expect(spec).toBe('current owner scope')
++    reached()
++    await hold
++    return { accepted: true }
++  })
++  await Promise.race([
++    arrived,
++    delivery.then(() => {
++      throw new Error('transport was never entered')
++    })
++  ])
++  revokeManagedPermit(f.db, f.runId, false)
++  let changed = false
++  const mutation = drainManagedDelivery(f.db, f.runId).then(() => {
++    changed = true
++  })
++  expect(changed).toBe(false)
++  release()
++  await delivery
++  await mutation
++  expect(changed).toBe(true)
++  await expect(
++    deliverManaged(f.db, f.runId, dispatch.id, async () => ({ accepted: true }))
++  ).rejects.toThrow('revoked')
++})
++
++test('revocation while transport waits aborts the actual acceptance boundary', async () => {
++  const f = await fixture(),
++    dispatch = f.start(await fenceManagedRun(f.db, f.runId, 'start'))
++  let arrived!: () => void, release!: () => void
++  const reached = new Promise<void>((resolve) => {
++    arrived = resolve
++  })
++  const hold = new Promise<void>((resolve) => {
++    release = resolve
++  })
++  let accepted = false
++  const delivery = deliverManaged(f.db, f.runId, dispatch.id, async (_spec, guard) => {
++    arrived()
++    await hold
++    guard!.assertCurrent()
++    accepted = true
++    return { accepted: true }
++  })
++  const rejected = expect(delivery).rejects.toThrow()
++  await reached
++  revokeManagedPermit(f.db, f.runId, true)
++  release()
++  await rejected
++  expect(accepted).toBe(false)
++})
++
++test('native stop closes the physical process even when its managed owner is offline', async () => {
++  const f = await fixture(),
++    dispatch = f.start(await fenceManagedRun(f.db, f.runId, 'start'))
++  await f.closeServer()
++  let physicallyStopped = false
++  const runtime = { getOrchestrationDb: () => f.db } as OrcaRuntimeService
++  await dedupeWorkerStop(runtime, dispatch.id, async () => {
++    assertManagedStop(f.db.db, f.runId, dispatch.id)
++    physicallyStopped = true
++    return { state: 'stopped' }
++  })
++  expect(physicallyStopped).toBe(true)
++  expect(registerManagedRun(f.db, { ...f.owner, action: 'status' })).toMatchObject({
++    closed: 1,
++    stopPending: 1
++  })
++  f.restart()
++  await expect(fenceManagedRun(f.db, f.runId, 'start', dispatch.id)).rejects.toThrow(
++    'stop remains pending'
++  )
++})
+diff --git a/src/main/runtime/orchestration/managed-run.ts b/src/main/runtime/orchestration/managed-run.ts
+new file mode 100644
+index 00000000..9b009114
+--- /dev/null
++++ b/src/main/runtime/orchestration/managed-run.ts
+@@ -0,0 +1,292 @@
++import {
++  MANAGED_CONTROL_SCHEMA,
++  managedControl,
++  revokeManagedPermit,
++  drainManagedDelivery
++} from './managed-delivery'
++import { requestManagedOwner } from './managed-owner-client'
++import { createHash } from 'node:crypto'
++import { isAbsolute } from 'node:path'
++import { OrchestrationError } from './orchestration-error'
++import type Database from '../../sqlite/sync-database'
++import type { OrchestrationDb } from './db'
++
++export const MANAGED_RUN_SCHEMA = `${MANAGED_CONTROL_SCHEMA}
++CREATE TABLE IF NOT EXISTS managed_runs (
++  run_id TEXT PRIMARY KEY, owner TEXT NOT NULL, token TEXT NOT NULL, endpoint TEXT NOT NULL,
++  generation INTEGER NOT NULL DEFAULT 0, dispatch_id TEXT, closed INTEGER NOT NULL DEFAULT 1);
++CREATE TABLE IF NOT EXISTS managed_intents (
++  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, action TEXT NOT NULL, previous TEXT,
++  generation INTEGER, consumed_by TEXT);
++CREATE TABLE IF NOT EXISTS managed_dispatches (
++  dispatch_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, generation INTEGER NOT NULL);
++CREATE TABLE IF NOT EXISTS managed_processes (
++  dispatch_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, proof_hash TEXT NOT NULL);
++CREATE TABLE IF NOT EXISTS managed_reports (
++  id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL, run_id TEXT NOT NULL, sequence INTEGER NOT NULL,
++  hash TEXT NOT NULL, credential_hash TEXT NOT NULL, request_json TEXT NOT NULL, proof_json TEXT NOT NULL, message_id TEXT,
++  UNIQUE(dispatch_id, sequence));
++CREATE TRIGGER IF NOT EXISTS managed_dispatch_admission BEFORE INSERT ON dispatch_contexts
++WHEN EXISTS(SELECT 1 FROM managed_runs WHERE run_id = NEW.run_id)
++AND NOT EXISTS(SELECT 1 FROM managed_dispatches WHERE dispatch_id = NEW.id AND run_id = NEW.run_id)
++BEGIN SELECT RAISE(ABORT, 'managed_dispatch_requires_fence'); END;
++`
++
++export function registerManagedRun(
++  db: OrchestrationDb,
++  input: {
++    runId: string
++    owner: string
++    token: string
++    endpoint: string
++    action: 'register' | 'status' | 'adopt'
++    dispatchId?: string
++  }
++) {
++  const existing = db.db.prepare('SELECT * FROM managed_runs WHERE run_id = ?').get(input.runId)
++  if (!existing) {
++    const run = db.getRun(input.runId)
++    if (input.action === 'status' || !run) {
++      throw new Error('managed_run_missing')
++    }
++    if (run.legacy) {
++      throw new Error('managed_run_requires_explicit_run')
++    }
++    if (
++      (!isAbsolute(input.endpoint) && !input.endpoint.startsWith('\\\\.\\pipe\\')) ||
++      input.endpoint.includes('\n')
++    ) {
++      throw new Error('managed_endpoint_invalid')
++    }
++    const latest = db.db
++      .prepare('SELECT id FROM dispatch_contexts WHERE run_id = ? ORDER BY rowid DESC LIMIT 1')
++      .get(input.runId)
++    if (input.action === 'adopt') {
++      if (
++        !latest ||
++        latest.id !== input.dispatchId ||
++        Number(
++          db.db
++            .prepare('SELECT COUNT(DISTINCT task_id) AS n FROM dispatch_contexts WHERE run_id = ?')
++            .get(input.runId)?.n
++        ) !== 1
++      ) {
++        throw new Error('managed_adoption_identity_mismatch')
++      }
++    } else if (latest) {
++      throw new Error('managed_run_requires_empty_run')
++    }
++    db.db.pragma('synchronous = FULL')
++    db.db
++      .prepare(
++        'INSERT INTO managed_runs(run_id, owner, token, endpoint, dispatch_id) VALUES (?, ?, ?, ?, ?)'
++      )
++      .run(
++        input.runId,
++        input.owner,
++        input.token,
++        input.endpoint,
++        input.action === 'adopt' ? input.dispatchId! : null
++      )
++  } else if (
++    existing.owner !== input.owner ||
++    existing.token !== input.token ||
++    existing.endpoint !== input.endpoint
++  ) {
++    throw new Error('managed_owner_mismatch')
++  }
++  const current = db.db
++    .prepare('SELECT generation, dispatch_id, closed FROM managed_runs WHERE run_id = ?')
++    .get(input.runId)
++  return {
++    runId: input.runId,
++    ...current,
++    stopPending: managedControl(db, input.runId).stop_pending
++  }
++}
++
++export async function fenceManagedRun(
++  db: OrchestrationDb,
++  runId: string,
++  action: 'start' | 'stop' | 'restart',
++  previous?: string
++): Promise<string | undefined> {
++  const owner = db.db.prepare('SELECT * FROM managed_runs WHERE run_id = ?').get(runId)
++  if (!owner) {
++    return undefined
++  }
++  if (action === 'stop' && (owner.dispatch_id ?? undefined) !== previous) {
++    return undefined
++  }
++  if ((owner.dispatch_id ?? undefined) !== previous) {
++    throw new Error('managed_predecessor_changed')
++  }
++  if (action !== 'start') {
++    revokeManagedPermit(db, runId, true)
++  }
++  const control = managedControl(db, runId)
++  if (action === 'start' && control.stop_pending) {
++    throw new OrchestrationError('managed_admission_refused', 'Managed stop remains pending.')
++  }
++  const finishStop = async () => {
++    await drainManagedDelivery(db, runId)
++    db.db
++      .prepare('UPDATE managed_controls SET stop_pending = 0 WHERE run_id = ? AND stop_pending = ?')
++      .run(runId, control.stop_pending)
++  }
++  const granted = db.db
++    .prepare(
++      'SELECT id FROM managed_intents WHERE run_id = ? AND action = ? AND previous IS ? AND generation = ? AND consumed_by IS NULL'
++    )
++    .get(runId, action, previous ?? null, owner.generation)
++  if (granted && action !== 'start') {
++    await finishStop()
++    return String(granted.id)
++  }
++  const id = granted
++    ? String(granted.id)
++    : `${runId}:${action}:${previous ?? 'initial'}:after:${owner.generation}`
++  db.db
++    .prepare(
++      'INSERT OR IGNORE INTO managed_intents(id, run_id, action, previous) VALUES (?, ?, ?, ?)'
++    )
++    .run(id, runId, action, previous ?? null)
++  const intent = db.db.prepare('SELECT generation FROM managed_intents WHERE id = ?').get(id)
++  if (intent?.generation != null && action !== 'start') {
++    await finishStop()
++    return id
++  }
++  const { generation } = await requestManagedOwner(String(owner.endpoint), {
++    id,
++    command: ['native', 'fence'],
++    options: {
++      token: String(owner.token),
++      assignment: String(owner.owner),
++      run: runId,
++      action,
++      previous: previous ?? ''
++    }
++  }).catch(() => {
++    throw new OrchestrationError(
++      'managed_admission_refused',
++      'Managed owner admission did not complete. No Dispatch was accepted; retry the same request after resolving the owner condition.'
++    )
++  })
++  db.db
++    .prepare('UPDATE managed_intents SET generation = ? WHERE id = ? AND generation IS NULL')
++    .run(generation, id)
++  db.db
++    .prepare(
++      'UPDATE managed_runs SET closed = 1, generation = ? WHERE run_id = ? AND dispatch_id IS ? AND generation <= ?'
++    )
++    .run(generation, runId, previous ?? null, generation)
++  if (action === 'start') {
++    const changed = db.db
++      .prepare(
++        'UPDATE managed_controls SET permit_id = ?, permit_sequence = ? WHERE run_id = ? AND sequence = ? AND stop_pending = 0'
++      )
++      .run(id, control.sequence, runId, control.sequence)
++    if (!changed.changes) {
++      throw new OrchestrationError(
++        'managed_admission_refused',
++        'Managed control changed during admission.'
++      )
++    }
++  } else {
++    await finishStop()
++  }
++  return id
++}
++
++export async function admitManagedProcess(
++  db: OrchestrationDb,
++  handle: string,
++  sessionId: string,
++  spawnToken: string
++): Promise<void> {
++  const historical = db.db
++    .prepare(
++      'SELECT id FROM dispatch_contexts WHERE assignee_handle = ? OR assignee_orca_session_id = ? OR id IN (SELECT dispatch_id FROM managed_processes WHERE session_id = ?) ORDER BY rowid DESC LIMIT 1'
++    )
++    .get(handle, sessionId, sessionId)
++  const dispatch = historical && db.getDispatchContextById(String(historical.id))
++  if (!dispatch) {
++    return
++  }
++  const owner = db.db.prepare('SELECT * FROM managed_runs WHERE run_id = ?').get(dispatch.run_id)
++  if (!owner) {
++    return
++  }
++  if (!['pending', 'dispatched'].includes(dispatch.status)) {
++    if (owner.dispatch_id === dispatch.id && !owner.closed) {
++      await fenceManagedRun(db, dispatch.run_id, 'restart', dispatch.id)
++    }
++    throw new Error('managed_process_restart_requires_task_retry')
++  }
++  if (owner.closed || owner.dispatch_id !== dispatch.id) {
++    throw new Error('managed_process_generation_fenced')
++  }
++  const hash = createHash('sha256').update(`osa-worker-v1:${sessionId}:${spawnToken}`).digest('hex')
++  const previous = db.db
++    .prepare('SELECT * FROM managed_processes WHERE dispatch_id = ?')
++    .get(dispatch.id)
++  if (previous && (previous.session_id !== sessionId || previous.proof_hash !== hash)) {
++    await fenceManagedRun(db, dispatch.run_id, 'restart', dispatch.id)
++    throw new Error('managed_process_restart_requires_task_retry')
++  }
++  db.db
++    .prepare('INSERT OR IGNORE INTO managed_processes VALUES (?, ?, ?)')
++    .run(dispatch.id, sessionId, hash)
++}
++
++/** Called in the dispatch transaction; the trigger also refuses older binaries and other start entry points. */
++export function consumeManagedStart(
++  db: Database.Database,
++  runId: string,
++  dispatchId: string,
++  intentId?: string
++): void {
++  const owner = db.prepare('SELECT * FROM managed_runs WHERE run_id = ?').get(runId)
++  if (!owner) {
++    return
++  }
++  const intent = db.prepare('SELECT * FROM managed_intents WHERE id = ?').get(intentId ?? '')
++  const control = db.prepare('SELECT * FROM managed_controls WHERE run_id = ?').get(runId)
++  if (
++    !control ||
++    control.stop_pending ||
++    control.permit_id !== intentId ||
++    control.permit_sequence !== control.sequence
++  ) {
++    throw new Error('managed_start_requires_current_fence')
++  }
++  if (
++    !intent ||
++    intent.run_id !== runId ||
++    intent.action !== 'start' ||
++    intent.generation == null ||
++    intent.generation !== owner.generation ||
++    intent.consumed_by ||
++    intent.previous !== owner.dispatch_id
++  ) {
++    throw new Error('managed_start_requires_current_fence')
++  }
++  db.prepare('INSERT INTO managed_dispatches VALUES (?, ?, ?)').run(
++    dispatchId,
++    runId,
++    intent.generation
++  )
++  db.prepare('UPDATE managed_intents SET consumed_by = ? WHERE id = ?').run(dispatchId, intentId!)
++  db.prepare(
++    'UPDATE managed_runs SET generation = ?, dispatch_id = ?, closed = 0 WHERE run_id = ?'
++  ).run(intent.generation, dispatchId, runId)
++}
++
++export function assertManagedStop(db: Database.Database, runId: string, dispatchId: string): void {
++  const owner = db
++    .prepare('SELECT closed, dispatch_id FROM managed_runs WHERE run_id = ?')
++    .get(runId)
++  if (owner?.dispatch_id === dispatchId && !owner.closed) {
++    throw new Error('managed_stop_requires_fence')
++  }
++}
+diff --git a/src/main/runtime/rpc/methods/orchestration/managed-methods.ts b/src/main/runtime/rpc/methods/orchestration/managed-methods.ts
+new file mode 100644
+index 00000000..961c37d8
+--- /dev/null
++++ b/src/main/runtime/rpc/methods/orchestration/managed-methods.ts
+@@ -0,0 +1,166 @@
++import { revokeManagedPermit } from '../../../orchestration/managed-delivery'
++import { createHash, timingSafeEqual } from 'node:crypto'
++import type { z } from 'zod'
++import { defineMethod } from '../../core'
++import {
++  ManagedRunParams,
++  WorkerAttestParams,
++  ReliabilityCapabilitiesParams
++} from '../../../../../shared/rpc-contract/orchestration-managed-params'
++import { registerManagedRun } from '../../../orchestration/managed-run'
++import type { OrcaRuntimeService } from '../../../orca-runtime'
++import { getStructuredAgentSessionHost } from '../../../../native-chat/agent-session-wire/structured-agent-session-registry'
++import { agentSessionLeaseAdmitsWriter } from '../../../../../shared/agent-session/lifecycle/agent-session-lease-adjudication'
++import { resolveStructuredWorkerIdentityForSession } from '../../../structured-worker-authority'
++
++export async function attestManagedWorker(
++  runtime: OrcaRuntimeService,
++  input: z.infer<typeof WorkerAttestParams>
++) {
++  const db = runtime.getOrchestrationDb()
++  let handle: string,
++    incarnation: string,
++    subject: string,
++    paneKey: string,
++    dispatchIncarnation: string
++  if (input.evidence.kind === 'session') {
++    await runtime.ensureStructuredAgentSessionHost()
++    const record = getStructuredAgentSessionHost()?.deps.store.requireWritableRecord(
++      input.evidence.sessionId
++    )
++    const token = record?.lease.ownerProcess?.spawnToken
++    if (!record || !token || !agentSessionLeaseAdmitsWriter(record.lease)) {
++      throw new Error('worker_identity_unavailable')
++    }
++    const expected = createHash('sha256')
++      .update(`osa-worker-v1:${input.evidence.sessionId}:${token}`)
++      .digest()
++    const supplied = Buffer.from(input.evidence.proof, 'hex')
++    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
++      throw new Error('worker_identity_refused')
++    }
++    const identity = resolveStructuredWorkerIdentityForSession(input.evidence.sessionId, db)
++    if (!identity || identity.hostScope.kind !== 'local') {
++      throw new Error('worker_identity_unavailable')
++    }
++    if (identity.sessionId !== input.evidence.sessionId) {
++      throw new Error('managed_worker_clear_requires_new_dispatch')
++    }
++    handle = identity.handle
++    paneKey = identity.paneKey
++    dispatchIncarnation = identity.processIncarnation
++    incarnation = `${input.evidence.sessionId}:${record.lease.runtimeFence}:${createHash('sha256').update(token).digest('hex')}`
++    subject = input.evidence.sessionId
++  } else {
++    const authority = runtime.verifyOrchestrationCompatibilityCaller(input.evidence)
++    if (!authority || authority.hostScope.kind !== 'local') {
++      throw new Error('worker_identity_refused')
++    }
++    handle = authority.terminalHandle
++    incarnation = authority.processIncarnation
++    subject = authority.paneKey
++    paneKey = authority.paneKey
++    dispatchIncarnation = authority.processIncarnation
++  }
++  let dispatch = db.getActiveDispatchForTerminal(handle)
++  if (!dispatch) {
++    throw new Error('worker_dispatch_inactive')
++  }
++  if (
++    !db.isDispatchProcessCurrent({
++      dispatchId: dispatch.id,
++      paneKey,
++      processIncarnation: dispatchIncarnation
++    })
++  ) {
++    throw new Error('worker_dispatch_process_mismatch')
++  }
++  if (
++    input.evidence.kind === 'session' &&
++    db.db.prepare('SELECT 1 FROM managed_runs WHERE run_id = ?').get(dispatch.run_id)
++  ) {
++    const process = db.db
++      .prepare('SELECT * FROM managed_processes WHERE dispatch_id = ?')
++      .get(dispatch.id)
++    if (
++      !process ||
++      process.session_id !== input.evidence.sessionId ||
++      process.proof_hash !== input.evidence.proof
++    ) {
++      throw new Error('worker_dispatch_spawn_mismatch')
++    }
++  }
++  if (
++    input.purpose === 'review-snapshot' &&
++    dispatch.creator_dispatch_id &&
++    !db.db
++      .prepare('SELECT 1 FROM managed_runs WHERE run_id = ? AND owner = ?')
++      .get(dispatch.run_id, input.audience)
++  ) {
++    dispatch = db.getDispatchContextById(dispatch.creator_dispatch_id)
++    if (!dispatch) {
++      throw new Error('review_parent_unavailable')
++    }
++  }
++  const managed = db.db
++    .prepare('SELECT owner, generation, dispatch_id, closed FROM managed_runs WHERE run_id = ?')
++    .get(dispatch.run_id)
++  if (
++    !managed ||
++    managed.closed ||
++    managed.dispatch_id !== dispatch.id ||
++    managed.owner !== input.audience
++  ) {
++    throw new Error('worker_generation_fenced')
++  }
++  return {
++    assignmentId: managed.owner,
++    generation: managed.generation,
++    dispatchId: dispatch.id,
++    taskId: dispatch.task_id,
++    runId: dispatch.run_id,
++    subject,
++    incarnation,
++    runtimeId: runtime.getRuntimeId(),
++    host: 'local',
++    audience: input.audience,
++    purpose: input.purpose ?? 'worker',
++    expiresAt: Date.now() + 30000
++  }
++}
++
++export const ORCHESTRATION_MANAGED_METHODS = [
++  defineMethod({
++    name: 'orchestration.reliabilityCapabilities',
++    permission: 'workspace',
++    params: ReliabilityCapabilitiesParams,
++    handler: () => ({
++      protocol: 1,
++      inputStream: 1,
++      managedExecution: 1,
++      authenticatedReports: 1,
++      deliveryFence: 1,
++      executionHosts: ['local']
++    })
++  }),
++  defineMethod({
++    name: 'orchestration.managedRun',
++    permission: 'workspace',
++    params: ManagedRunParams,
++    handler: (params, { runtime }) => {
++      const db = runtime.getOrchestrationDb()
++      if (params.action !== 'revoke') {
++        return registerManagedRun(db, { ...params, action: params.action })
++      }
++      registerManagedRun(db, { ...params, action: 'status' })
++      revokeManagedPermit(db, params.runId, false)
++      return registerManagedRun(db, { ...params, action: 'status' })
++    }
++  }),
++  defineMethod({
++    name: 'orchestration.attestWorker',
++    permission: 'workspace',
++    params: WorkerAttestParams,
++    handler: (params, { runtime }) => attestManagedWorker(runtime, params)
++  })
++]
+diff --git a/src/main/runtime/rpc/methods/orchestration/managed-report-methods.ts b/src/main/runtime/rpc/methods/orchestration/managed-report-methods.ts
+new file mode 100644
+index 00000000..4295ae22
+--- /dev/null
++++ b/src/main/runtime/rpc/methods/orchestration/managed-report-methods.ts
+@@ -0,0 +1,183 @@
++import { createHash } from 'node:crypto'
++import { defineMethod } from '../../core'
++import {
++  WorkerReportParams,
++  ManagedReportsParams,
++  WorkerReportReceiptParams
++} from '../../../../../shared/rpc-contract/orchestration-managed-params'
++import { attestManagedWorker } from './managed-methods'
++
++export const ORCHESTRATION_MANAGED_REPORT_METHODS = [
++  defineMethod({
++    name: 'orchestration.workerReportReceipt',
++    permission: 'workspace',
++    params: WorkerReportReceiptParams,
++    handler: (params, { runtime }) => {
++      const row = runtime
++        .getOrchestrationDb()
++        .db.prepare('SELECT * FROM managed_reports WHERE id = ?')
++        .get(params.reportId)
++      const credential = createHash('sha256').update(JSON.stringify(params.evidence)).digest('hex')
++      if (!row || row.credential_hash !== credential) {
++        throw new Error('worker_report_receipt_denied')
++      }
++      const proof = JSON.parse(String(row.proof_json))
++      if (proof.assignmentId !== params.audience) {
++        throw new Error('worker_report_receipt_denied')
++      }
++      return {
++        reportId: params.reportId,
++        messageId: row.message_id,
++        state: row.message_id ? 'queued' : 'reserved',
++        proof
++      }
++    }
++  }),
++  defineMethod({
++    name: 'orchestration.workerReport',
++    permission: 'workspace',
++    params: WorkerReportParams,
++    handler: async (params, { runtime }) => {
++      if (params.purpose && params.purpose !== 'worker') {
++        throw new Error('worker_report_requires_worker_authority')
++      }
++      const db = runtime.getOrchestrationDb()
++      const request = {
++        command: params.request.command,
++        options: Object.fromEntries(
++          Object.entries(params.request.options).sort(([a], [b]) => a.localeCompare(b))
++        )
++      }
++      const body = JSON.stringify(request)
++      if (Buffer.byteLength(body) > 500000) {
++        throw new Error('worker_report_too_large')
++      }
++      const hash = createHash('sha256').update(body).digest('hex')
++      const credential = createHash('sha256').update(JSON.stringify(params.evidence)).digest('hex')
++      const previous = db.db
++        .prepare('SELECT * FROM managed_reports WHERE id = ?')
++        .get(params.reportId)
++      if (previous && (previous.hash !== hash || previous.credential_hash !== credential)) {
++        throw new Error('worker_report_id_conflict')
++      }
++      if (previous?.message_id) {
++        return {
++          reportId: params.reportId,
++          sequence: previous.sequence,
++          messageId: previous.message_id,
++          state: 'queued'
++        }
++      }
++      const proof = await attestManagedWorker(runtime, params)
++      if (request.options.assignment !== proof.assignmentId) {
++        throw new Error('worker_report_assignment_mismatch')
++      }
++      const result = db.commitWorkerDoneMessageMutation(() => {
++        const current = db.db
++          .prepare('SELECT * FROM managed_runs WHERE run_id = ?')
++          .get(proof.runId)
++        if (
++          !current ||
++          current.closed ||
++          current.dispatch_id !== proof.dispatchId ||
++          current.generation !== proof.generation
++        ) {
++          throw new Error('worker_generation_fenced')
++        }
++        let report = db.db
++          .prepare('SELECT * FROM managed_reports WHERE id = ?')
++          .get(params.reportId)
++        if (!report) {
++          if (
++            db.db
++              .prepare('SELECT 1 FROM managed_reports WHERE dispatch_id = ? AND message_id IS NULL')
++              .get(proof.dispatchId)
++          ) {
++            throw new Error('worker_report_prior_reservation_unresolved')
++          }
++          const sequence =
++            Number(
++              db.db
++                .prepare(
++                  'SELECT COALESCE(MAX(sequence), 0) AS n FROM managed_reports WHERE dispatch_id = ?'
++                )
++                .get(proof.dispatchId)?.n
++            ) + 1
++          db.db
++            .prepare(
++              'INSERT INTO managed_reports(id, dispatch_id, run_id, sequence, hash, credential_hash, request_json, proof_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
++            )
++            .run(
++              params.reportId,
++              proof.dispatchId,
++              proof.runId,
++              sequence,
++              hash,
++              credential,
++              body,
++              JSON.stringify(proof)
++            )
++          report = db.db.prepare('SELECT * FROM managed_reports WHERE id = ?').get(params.reportId)
++        }
++        if (!report || report.hash !== hash || report.credential_hash !== credential) {
++          throw new Error('worker_report_id_conflict')
++        }
++        let messageId = report.message_id
++        if (params.action === 'enqueue' && !messageId) {
++          messageId = db.insertMessage({
++            from: `dispatch:${proof.dispatchId}`,
++            to: `run:${proof.runId}`,
++            runId: proof.runId,
++            subject: 'OSA domain report',
++            type: 'status',
++            payload: JSON.stringify({ protocol: 'osa-report-v1', reportId: params.reportId })
++          }).id
++          db.db
++            .prepare('UPDATE managed_reports SET message_id = ? WHERE id = ?')
++            .run(messageId, params.reportId)
++        }
++        return {
++          reportId: params.reportId,
++          sequence: report.sequence,
++          messageId,
++          state: messageId ? 'queued' : 'reserved'
++        }
++      })
++      if (result.messageId) {
++        runtime.notifyMessageArrived(`run:${proof.runId}`, 'status')
++      }
++      return result
++    }
++  }),
++  defineMethod({
++    name: 'orchestration.managedReports',
++    permission: 'workspace',
++    params: ManagedReportsParams,
++    handler: (params, { runtime }) => {
++      const db = runtime.getOrchestrationDb().db
++      const owner = db
++        .prepare('SELECT owner, token FROM managed_runs WHERE run_id = ?')
++        .get(params.runId)
++      if (!owner || owner.owner !== params.owner || owner.token !== params.token) {
++        throw new Error('managed_owner_mismatch')
++      }
++      return {
++        reports: params.messageIds.map((id) => {
++          const row = db
++            .prepare('SELECT * FROM managed_reports WHERE message_id = ? AND run_id = ?')
++            .get(id, params.runId)
++          return row
++            ? {
++                messageId: id,
++                reportId: row.id,
++                sequence: row.sequence,
++                hash: row.hash,
++                request: JSON.parse(String(row.request_json)),
++                proof: JSON.parse(String(row.proof_json))
++              }
++            : { messageId: id, refusal: 'not-an-authenticated-report' }
++        })
++      }
++    }
++  })
++]
+diff --git a/src/main/runtime/rpc/methods/orchestration/worker/worker-stop-flight.ts b/src/main/runtime/rpc/methods/orchestration/worker/worker-stop-flight.ts
+new file mode 100644
+index 00000000..5eaa0df4
+--- /dev/null
++++ b/src/main/runtime/rpc/methods/orchestration/worker/worker-stop-flight.ts
+@@ -0,0 +1,46 @@
++import type { OrcaRuntimeService } from '../../../../orca-runtime'
++import { fenceManagedRun } from '../../../../orchestration/managed-run'
++
++const activeStopByRuntime = new WeakMap<OrcaRuntimeService, Map<string, Promise<unknown>>>()
++
++/** Coalesce same-runtime stops so only one closes; beginWorkerStop admits this epoch only to recover a row stranded by a dead runtime. */
++export function dedupeWorkerStop(
++  runtime: OrcaRuntimeService,
++  dispatchId: string,
++  stop: () => Promise<unknown>
++): Promise<unknown> {
++  let active = activeStopByRuntime.get(runtime)
++  if (!active) {
++    active = new Map()
++    activeStopByRuntime.set(runtime, active)
++  }
++  const inFlight = active.get(dispatchId)
++  if (inFlight) {
++    return inFlight
++  }
++  const started: Promise<unknown> = Promise.resolve()
++    .then(async () => {
++      const db = runtime.getOrchestrationDb(),
++        context = db.getDispatchContextById(dispatchId)
++      // Local closure fences synchronously; owner outage must not keep the old process running.
++      const fence = context
++        ? fenceManagedRun(db, context.run_id, 'stop', dispatchId).catch((error) => {
++            if (
++              !db.db.prepare('SELECT closed FROM managed_runs WHERE run_id = ?').get(context.run_id)
++                ?.closed
++            ) {
++              throw error
++            }
++          })
++        : Promise.resolve()
++      const [result] = await Promise.all([stop(), fence])
++      return result
++    })
++    .finally(() => {
++      if (active.get(dispatchId) === started) {
++        active.delete(dispatchId)
++      }
++    })
++  active.set(dispatchId, started)
++  return started
++}
+diff --git a/src/main/runtime/rpc/orchestration-managed-report.test.ts b/src/main/runtime/rpc/orchestration-managed-report.test.ts
+new file mode 100644
+index 00000000..3b4209d2
+--- /dev/null
++++ b/src/main/runtime/rpc/orchestration-managed-report.test.ts
+@@ -0,0 +1,195 @@
++import './unused-default-rpc-methods.test-fixture'
++import { createHash } from 'node:crypto'
++import { afterEach, expect, test, vi } from 'vitest'
++import {
++  createSessionCallerHarness,
++  orchestrationRequest,
++  resultOf,
++  SESSION_X,
++  WORKSPACE_X,
++  type SessionCallerHarness
++} from './orchestration-session-caller-test-fixture'
++import {
++  mintStructuredWorkerHandle,
++  mintStructuredWorkerPaneKey,
++  structuredWorkerIdentities,
++  structuredWorkerProcessIncarnation
++} from '../structured-worker-identity'
++import { registerManagedRun, admitManagedProcess } from '../orchestration/managed-run'
++
++const hostRef = vi.hoisted((): { current: unknown } => ({ current: null }))
++vi.mock('../../native-chat/agent-session-wire/structured-agent-session-registry', () => ({
++  getStructuredAgentSessionHost: () => hostRef.current
++}))
++let h: SessionCallerHarness
++afterEach(() => {
++  h?.close()
++  vi.restoreAllMocks()
++})
++async function fixture() {
++  h = createSessionCallerHarness(hostRef)
++  const run = h.db.createRun({
++    objective: 'managed report',
++    coordinatorHandle: null,
++    coordinatorPaneKey: null
++  })
++  const owner = {
++    runId: run.id,
++    owner: 'assignment',
++    token: 's'.repeat(32),
++    endpoint: '/tmp/unused-owner.sock',
++    action: 'register' as const
++  }
++  registerManagedRun(h.db, owner)
++  // Seed only the owner grant; Dispatch creation, process pin, RPC authentication and report transaction are real.
++  h.db.db
++    .prepare(
++      "INSERT INTO managed_intents(id, run_id, action, generation) VALUES ('grant', ?, 'start', 1)"
++    )
++    .run(run.id)
++  h.db.db.prepare('UPDATE managed_runs SET generation = 1 WHERE run_id = ?').run(run.id)
++  h.db.db
++    .prepare(
++      "INSERT INTO managed_controls(run_id, sequence, permit_id, permit_sequence) VALUES (?, 0, 'grant', 0)"
++    )
++    .run(run.id)
++  const task = h.db.createTask({ runId: run.id, spec: 'report' })
++  const dispatch = h.db.createStartingWorkerDispatch({
++    creator: { kind: 'system' },
++    maxDepth: 10,
++    taskId: task.id,
++    startOptions: {},
++    managedIntent: 'grant'
++  }).dispatch
++  const handle = mintStructuredWorkerHandle(),
++    paneKey = mintStructuredWorkerPaneKey(SESSION_X),
++    processIncarnation = structuredWorkerProcessIncarnation(SESSION_X)
++  structuredWorkerIdentities.register({
++    handle,
++    sessionId: SESSION_X,
++    agent: 'claude',
++    paneKey,
++    processIncarnation,
++    worktreeId: WORKSPACE_X,
++    hostScope: { kind: 'local', hostId: 'local' }
++  })
++  h.db.prepareStartingWorkerAuthority({
++    dispatchId: dispatch.id,
++    handle,
++    paneKey,
++    processIncarnation,
++    worktreeId: WORKSPACE_X,
++    effects: [],
++    setupState: 'not_applicable'
++  })
++  await admitManagedProcess(h.db, handle, SESSION_X, 'spawn-owner')
++  const evidence = {
++    kind: 'session',
++    sessionId: SESSION_X,
++    proof: createHash('sha256').update(`osa-worker-v1:${SESSION_X}:spawn-owner`).digest('hex')
++  }
++  const request = {
++    command: ['report', 'progress'],
++    options: {
++      ticket: 'ticket',
++      assignment: owner.owner,
++      token: 'capability',
++      summary: 'step complete'
++    }
++  }
++  const enqueue = (id: string) =>
++    h.dispatch(
++      orchestrationRequest('orchestration.workerReport', {
++        action: 'enqueue',
++        reportId: id,
++        audience: owner.owner,
++        evidence,
++        request
++      })
++    )
++  return { run, owner, dispatch, evidence, request, enqueue }
++}
++
++test('RPC report commits one authenticated mailbox item, replays safely, and old proof only reads its receipt', async () => {
++  const f = await fixture()
++  const first = resultOf(await f.enqueue('report-1'))
++  expect(first).toMatchObject({ reportId: 'report-1', state: 'queued', sequence: 1 })
++  expect(resultOf(await f.enqueue('report-1'))).toEqual(first)
++  expect(h.db.db.prepare('SELECT COUNT(*) AS n FROM managed_reports').get()).toMatchObject({ n: 1 })
++  const batch = resultOf(
++    await h.dispatch(
++      orchestrationRequest('orchestration.managedReports', {
++        runId: f.run.id,
++        owner: f.owner.owner,
++        token: f.owner.token,
++        messageIds: [first.messageId, 'ordinary-mail']
++      })
++    )
++  )
++  expect(batch.reports).toEqual([
++    expect.objectContaining({
++      reportId: 'report-1',
++      proof: expect.objectContaining({ dispatchId: f.dispatch.id, generation: 1 })
++    }),
++    { messageId: 'ordinary-mail', refusal: 'not-an-authenticated-report' }
++  ])
++  h.db.db
++    .prepare('UPDATE managed_runs SET closed = 1, generation = 2 WHERE run_id = ?')
++    .run(f.run.id)
++  expect(await f.enqueue('report-2')).toMatchObject({ ok: false })
++  expect(resultOf(await f.enqueue('report-1'))).toEqual(first)
++  expect(
++    resultOf(
++      await h.dispatch(
++        orchestrationRequest('orchestration.workerReportReceipt', {
++          reportId: 'report-1',
++          audience: f.owner.owner,
++          evidence: f.evidence
++        })
++      )
++    )
++  ).toMatchObject({ state: 'queued' })
++  expect(
++    await h.dispatch(
++      orchestrationRequest('orchestration.workerReportReceipt', {
++        reportId: 'report-1',
++        audience: f.owner.owner,
++        evidence: { ...f.evidence, proof: '0'.repeat(64) }
++      })
++    )
++  ).toMatchObject({ ok: false })
++})
++
++test('RPC rejects changed process proof, immutable ID conflict and rolls back when mailbox insertion fails', async () => {
++  const f = await fixture()
++  expect(
++    await h.dispatch(
++      orchestrationRequest('orchestration.attestWorker', {
++        audience: f.owner.owner,
++        evidence: { ...f.evidence, proof: '0'.repeat(64) }
++      })
++    )
++  ).toMatchObject({ ok: false })
++  const insertion = vi.spyOn(h.db, 'insertMessage').mockImplementationOnce(() => {
++    throw new Error('injected mailbox failure')
++  })
++  expect(await f.enqueue('crash')).toMatchObject({ ok: false })
++  expect(h.db.db.prepare('SELECT COUNT(*) AS n FROM managed_reports').get()).toMatchObject({ n: 0 })
++  insertion.mockRestore()
++  expect(resultOf(await f.enqueue('crash'))).toMatchObject({ sequence: 1, state: 'queued' })
++  expect(
++    await h.dispatch(
++      orchestrationRequest('orchestration.workerReport', {
++        action: 'enqueue',
++        reportId: 'crash',
++        audience: f.owner.owner,
++        evidence: f.evidence,
++        request: { ...f.request, options: { ...f.request.options, summary: 'changed' } }
++      })
++    )
++  ).toMatchObject({ ok: false })
++  h.db.db
++    .prepare("UPDATE managed_processes SET proof_hash = 'different' WHERE dispatch_id = ?")
++    .run(f.dispatch.id)
++  expect(await f.enqueue('different-process')).toMatchObject({ ok: false })
++})
+diff --git a/src/shared/rpc-contract/agent-session-input-stream-params.ts b/src/shared/rpc-contract/agent-session-input-stream-params.ts
+new file mode 100644
+index 00000000..9f407dd5
+--- /dev/null
++++ b/src/shared/rpc-contract/agent-session-input-stream-params.ts
+@@ -0,0 +1,11 @@
++import { z } from 'zod'
++
++export const InputStreamRequest = z
++  .object({
++    sessionId: z.string().min(1),
++    consumer: z.string().min(32).max(256),
++    action: z.enum(['register', 'read', 'ack', 'barrier']),
++    streamId: z.string().optional(),
++    cursor: z.number().int().nonnegative().safe().optional()
++  })
++  .strict()
+diff --git a/src/shared/rpc-contract/orchestration-managed-params.ts b/src/shared/rpc-contract/orchestration-managed-params.ts
+new file mode 100644
+index 00000000..78e88df7
+--- /dev/null
++++ b/src/shared/rpc-contract/orchestration-managed-params.ts
+@@ -0,0 +1,69 @@
++import { z } from 'zod'
++
++export const ReliabilityCapabilitiesParams = z.object({}).strict()
++
++export const ManagedRunParams = z
++  .object({
++    runId: z.string().min(1),
++    owner: z.string().min(1),
++    token: z.string().min(32),
++    endpoint: z.string().min(1),
++    action: z.enum(['register', 'status', 'adopt', 'revoke']),
++    dispatchId: z.string().min(1).optional()
++  })
++  .strict()
++export const WorkerAttestParams = z
++  .object({
++    evidence: z.discriminatedUnion('kind', [
++      z
++        .object({
++          kind: z.literal('session'),
++          sessionId: z.string().min(1),
++          proof: z.string().length(64)
++        })
++        .strict(),
++      z
++        .object({
++          kind: z.literal('terminal'),
++          terminalHandle: z.string().min(1),
++          paneKey: z.string().min(1),
++          launchToken: z.string().min(1)
++        })
++        .strict()
++    ]),
++    audience: z.string().min(1),
++    purpose: z.enum(['worker', 'review-snapshot']).optional()
++  })
++  .strict()
++
++export const WorkerReportParams = WorkerAttestParams.extend({
++  action: z.literal('enqueue'),
++  reportId: z.string().min(1).max(256),
++  request: z
++    .object({
++      command: z.tuple([
++        z.literal('report'),
++        z.enum(['ready', 'blocked', 'dropped', 'failed', 'progress', 'waiting'])
++      ]),
++      options: z
++        .object({
++          ticket: z.string().trim().min(1),
++          assignment: z.string().min(1),
++          token: z.string().min(1),
++          summary: z.string().trim().min(1)
++        })
++        .catchall(z.string())
++    })
++    .strict()
++}).strict()
++export const ManagedReportsParams = z
++  .object({
++    runId: z.string().min(1),
++    owner: z.string().min(1),
++    token: z.string().min(32),
++    messageIds: z.array(z.string()).max(1000)
++  })
++  .strict()
++export const WorkerReportReceiptParams = WorkerAttestParams.extend({
++  reportId: z.string().min(1).max(256)
++}).strict()

@@ -1,0 +1,19 @@
+{
+  "name": "orca-super-agent",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "osa": "node --experimental-transform-types bin/osa.ts",
+    "test": "vitest run --exclude '**/.osa/**'",
+    "typecheck": "tsc --noEmit",
+    "router:takeover": "node --experimental-transform-types bin/osa-router-takeover.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.12"
+  }
+}
