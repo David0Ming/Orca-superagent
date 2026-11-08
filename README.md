@@ -35,6 +35,8 @@ rtk proxy orca plugin dev load plugin/osa --json
 
 侧栏的“打开任务工作台”打开主区域标签页；也可在 Orca 新建文件菜单选择“OSA 工作台”。工作台按日期、项目或工作树查看任务，项目当天清单可直接提出要求。原侧栏保留配置、登记与旧任务入口。查询不领取 Router 租约。未连接、未绑定 Router、来源异常和空列表会分别显示；后台刷新保留草稿。相关说明见 [插件](plugin/osa/README.md)。
 
+工作台输入栏支持多行、粘贴截图、拖入／选择附件、上传进度、重试与草稿；也可只发送附件。Enter 发送，Shift+Enter 换行，Cmd/Ctrl+Enter 发送。单文件最多 20 MiB，每条最多 10 个附件；历史图片可预览并保存。详见 [输入栏实现与验证](docs/COMPOSER-20261108.md)。
+
 在要作为 Router 的 Orca 结构化聊天中加载 [Router skill](skills/super-agent-router/SKILL.md)，再运行：
 
 ```sh

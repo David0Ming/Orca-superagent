@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { App } from '../src/app.ts'
 import { Store } from '../src/store.ts'
+import { randomUUID } from 'node:crypto'
 import type { Executor } from '../vendor/dsh-core/src/index.ts'
 
 const dirs: string[] = [], stores: Store[] = []
@@ -800,4 +801,65 @@ test('accepting a pending clarification uses the original unresolved request man
   expect(read.triggers.map((trigger:any)=>trigger.text)).toEqual(['  Fix exports  ','  Keep timezone  '])
   expect(f.call(['route','accept'],{trigger:'panel:timezone-clue',title:'Exports'}).ticketId).toBe(ticket.id)
   expect(f.store.tickets.list()).toHaveLength(1)
+})
+
+
+test('attachment-only requests preserve empty original text and expose verified files to Router and Executor context', () => {
+  const f=setup(); execFileSync('git',['init','-q',f.dir])
+  f.call(['owner','project-add'],{id:'p',name:'Project'}); f.call(['owner','repository-add'],{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  const id=randomUUID(), bytes=Buffer.from([137,80,78,71,13,10,26,10])
+  const uploaded=f.call(['owner','attachment-write'],{id,name:'截图.png',mime:'image/png',size:String(bytes.length),offset:'0',data:bytes.toString('base64')})
+  expect(uploaded).toMatchObject({id,name:'截图.png',mime:'image/png',ready:true,offset:bytes.length})
+  expect(uploaded).not.toHaveProperty('path')
+  const options={id:'image-only',project:'p',text:'',attachments:JSON.stringify([id])}
+  f.call(['owner','request'],options); f.call(['owner','request'],options)
+  const trigger=f.store.triggers.get('panel:image-only')!
+  expect(trigger.text).toBe('')
+  expect(trigger.meta.attachments).toEqual([expect.objectContaining({id,name:'截图.png',mime:'image/png',path:expect.any(String),sha256:uploaded.sha256})])
+  expect(f.call(['router','wait']).topicInputs[0].meta.attachments).toEqual(trigger.meta.attachments)
+  const {ticketId}=f.call(['route','accept'],{trigger:trigger.id,title:'查看附件'})
+  const ticket=f.store.tickets.get(ticketId)!, assignment=ticket.assignments[0].id
+  expect(ticket.mandate.scope).toBe('[无文字的附件请求：截图.png]')
+  expect(f.store.triggers.get(trigger.id)?.text).toBe('')
+  f.store.put('capability',assignment,{token:'file-context'}); f.app.engine.assignmentStarted(ticket.id,assignment)
+  const context=f.call(['read'],{ticket:ticket.id,assignment,token:'file-context'})
+  expect(context.triggers[0].meta.attachments).toEqual(trigger.meta.attachments)
+  expect(f.call(['owner','attachment-read'],{id,offset:'0'})).toMatchObject({data:bytes.toString('base64'),done:true})
+  expect(f.store.list('core.trigger')).toHaveLength(1)
+})
+
+test('message identities include the exact ready attachment references, including topic comment retries', () => {
+  const f=setup(); f.call(['owner','project-add'],{id:'p',name:'Project'})
+  const upload=(name:string) => {
+    const id=randomUUID(), bytes=Buffer.from(name)
+    f.call(['owner','attachment-write'],{id,name,mime:'text/plain',size:String(bytes.length),offset:'0',data:bytes.toString('base64')})
+    return id
+  }
+  const first=upload('first.txt'), second=upload('second.txt'), text='  Keep my exact words.\n  '
+  f.call(['owner','request'],{id:'with-file',project:'p',text,attachments:JSON.stringify([first])})
+  expect(()=>f.call(['owner','request'],{id:'with-file',project:'p',text,attachments:JSON.stringify([second])})).toThrow('different content')
+  const options={id:'file-comment',trigger:'panel:with-file',text:'',attachments:JSON.stringify([second])}
+  f.call(['owner','comment'],options); f.call(['owner','comment'],options)
+  expect(()=>f.call(['owner','comment'],{...options,attachments:JSON.stringify([first])})).toThrow('different content')
+  expect(f.store.triggers.get('panel:with-file')?.text).toBe(text)
+  expect(f.store.triggers.get('panel:file-comment')?.text).toBe('')
+  const restarted=new App(f.store,f.executor,'owner')
+  expect(restarted.handle({command:['owner','comment'],options,id:'retry'})).toMatchObject({result:'duplicate'})
+  expect(f.store.list('core.trigger')).toHaveLength(2)
+})
+
+test('partial or unreadable attachments cannot be submitted or returned as successful content', () => {
+  const f=setup(); f.call(['owner','project-add'],{id:'p',name:'Project'})
+  const id=randomUUID(), options={id,name:'missing.txt',mime:'text/plain',size:'4',offset:'0',data:Buffer.from('ab').toString('base64')}
+  f.call(['owner','attachment-write'],options)
+  expect(()=>f.call(['owner','request'],{id:'not-ready',project:'p',text:'Read this',attachments:JSON.stringify([id])})).toThrow('not ready')
+  expect(()=>f.call(['owner','attachment-read'],{id,offset:'0'})).toThrow('not ready')
+  expect(()=>f.call(['owner','request'],{id:'empty',project:'p',text:''})).toThrow('text or a ready attachment')
+  f.call(['owner','attachment-write'],{...options,offset:'2',data:Buffer.from('cd').toString('base64')})
+  const path=f.store.get<any>('attachment',id).path
+  rmSync(path)
+  expect(()=>f.call(['owner','attachment-read'],{id,offset:'0'})).toThrow()
+  expect(()=>f.call(['owner','request'],{id:'unreadable',project:'p',text:'Read this',attachments:JSON.stringify([id])})).toThrow()
+  expect(f.store.list('core.trigger')).toHaveLength(0)
+  expect(f.call(['owner','status']).rejectedSubmissions).toEqual(expect.arrayContaining([expect.objectContaining({id:'unreadable',text:'Read this',error:expect.any(String)})]))
 })

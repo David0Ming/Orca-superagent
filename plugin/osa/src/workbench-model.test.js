@@ -160,3 +160,12 @@ test('a handed-back comment cannot steal the original topic alias from its ownin
   assert.equal(model.topics.find(topic => topic.id === 'ticket:B').originDay, dateKey(child.at))
   assert.equal(model.uniqueCount, 2)
 })
+
+
+test('attachment-only request keeps empty original text and presents its actual file name', () => {
+  const trigger={id:'image',source:'panel',human:true,text:'',at:'2026-11-08T01:00:00Z',meta:{projectId:'p',attachments:[{id:'file',name:'界面.png',mime:'image/png',size:100,path:'/state/attachments/file'}]}}
+  const model=buildWorkbench({triggers:[trigger],tickets:[]})
+  assert.equal(model.topics[0].title,'附件：界面.png')
+  assert.equal(model.topics[0].conversation[0].text,'')
+  assert.equal(model.topics[0].conversation[0].trigger.meta.attachments[0].path,'/state/attachments/file')
+})

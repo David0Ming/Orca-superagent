@@ -68,3 +68,18 @@ button:disabled { cursor: not-allowed; opacity: .5 }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0) }
 @media(max-width:900px) { .task-main { grid-template-columns: minmax(100px,1fr) auto 42px } .task-preview { display: none } .switch button { padding: 4px 8px } }
 @media(max-width:700px) { .top { padding: 0 12px } .toolbar { padding: 8px 12px; gap: 5px } .toolbar select { max-width: 90px } .layout { display: block; position: relative } .list-pane,.detail-pane { height: 100% } .detail-pane { display: none } .layout.show-detail .list-pane { display: none } .layout.show-detail .detail-pane { display: flex } .detail-head .back { display: inline-block } .detail-body,.detail-head { padding-left: 16px; padding-right: 16px } .composer { padding: 12px 16px } .composer-actions .muted { display: none } }
+.inline-form { flex-wrap: wrap; align-items: flex-end }
+.inline-form textarea { flex: 1; min-width: 100px; resize: none; max-height: 180px; border: 1px solid var(--orca-input,#d6dbe1); border-radius: 5px; padding: 7px 9px; background: transparent }
+.attachment-picker { cursor: pointer; padding: 5px; flex: none }
+.attachment-picker input,.reselect input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0) }
+.attachment-picker:focus-within,.reselect:focus-within { outline: 2px solid var(--orca-ring,#4777df) }
+.attachment-tray { display: flex; gap: 6px; flex-wrap: wrap; width: 100%; order: 2 }
+.attachment-tray:empty { display: none }
+.attachment { display: flex; align-items: center; gap: 5px; max-width: 100%; padding: 4px 7px; background: var(--orca-muted,#f0f2f5); border-radius: 5px; font-size: 12px; overflow-wrap: anywhere }
+.attachment img { width: 32px; height: 32px; object-fit: cover; border-radius: 3px }
+.attachment button { border: 0; background: transparent }
+.reselect { cursor: pointer; text-decoration: underline }
+.history-attachment { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px }
+.history-attachment img { max-width: 260px; max-height: 180px; object-fit: contain; cursor: zoom-in }
+.history-attachment img.expanded { max-width: 100%; max-height: none; cursor: zoom-out }
+.history-attachment button { border: 1px solid var(--orca-border,#d6dbe1); background: transparent; border-radius: 5px; padding: 4px 8px }

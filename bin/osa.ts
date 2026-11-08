@@ -18,7 +18,7 @@ import { RouterWake } from '../src/router.ts'
 import { collectWatchdog } from '../src/watchdog.ts'
 import { Windows } from '../src/windows.ts'
 
-const names = ['workspace', 'continue-from', 'fingerprint', 'purpose', 'asked-by', 'answers', 'state', 'repository', 'cli', 'lease', 'ticket', 'assignment', 'token', 'inputs', 'message', 'summary', 'question', 'trigger', 'reason', 'thread', 'id', 'text', 'title', 'scope', 'name', 'note', 'timeout', 'github', 'gh-cli', 'two-layer', 'dispatch', 'publish', 'body', 'feishu-chat', 'lark-cli', 'stall-ms', 'executor-model', 'executor-agent', 'locations', 'search']
+const names = ['workspace', 'continue-from', 'fingerprint', 'purpose', 'asked-by', 'answers', 'state', 'repository', 'cli', 'lease', 'ticket', 'assignment', 'token', 'inputs', 'message', 'summary', 'question', 'trigger', 'reason', 'thread', 'id', 'text', 'title', 'scope', 'name', 'note', 'timeout', 'github', 'gh-cli', 'two-layer', 'dispatch', 'publish', 'body', 'feishu-chat', 'lark-cli', 'stall-ms', 'executor-model', 'executor-agent', 'locations', 'search', 'attachments', 'mime', 'size', 'offset', 'data']
 names.push('project', 'projects', 'component', 'location', 'host', 'kind', 'repo-id', 'base-branch', 'github-repository', 'github-owner-id', 'github-owner-login', 'priority', 'depends-on', 'resources', 'goal', 'source', 'version', 'terminal', 'max-executors', 'acceptance-ticket', 'next-step', 'evidence', 'session', 'watchdog-events', 'report-to')
 const parsed = parseArgs({ options: Object.fromEntries(names.map(name => [name, { type: 'string' as const }])), allowPositionals: true })
 const options = parsed.values as Record<string, string>

@@ -80,7 +80,7 @@ export function buildWorkbench(status = {}, { timeZone } = {}) {
     if (rows(status.outbox).some(message => !message.ticketId && !message.triggerId && message.kind === 'reply' && originals.some(trigger => trigger.source === 'router' && trigger.channel?.source && trigger.channel?.thread && trigger.channel.source === message.channel?.source && trigger.channel.thread === message.channel?.thread))) historyLimitations.push('共享 Router 会话的未关联回复无法可靠归属到单个请求。')
     if (windows.length) historyLimitations.push('关联窗口仅显示元数据；历史需按需查看。')
     return { id: ticket ? `ticket:${ticketId}` : `request:${original.id}`, ...(ticket ? { ticketId, ticket } : { triggerId: original.id, trigger: original }),
-      draftTopicId: originalIds[0] || null, title: ticket?.title || original?.text || '未命名请求', projectId, projectName, entryProjectIds, entryProjects, originDay, activityDays, conversation,
+      draftTopicId: originalIds[0] || null, title: ticket?.title || original?.text || (rows(original?.meta?.attachments).length ? `附件：${original.meta.attachments.map(file => file.name).join('、')}` : '未命名请求'), projectId, projectName, entryProjectIds, entryProjects, originDay, activityDays, conversation,
       worktrees: rows(context.workspaces).filter(workspace => workspace.directory || workspace.worktreeId), targets: rows(context.targets), windows,
       publications: rows(status.publications).filter(publication => publication.ticketId === ticketId), historyLimitations }
   }

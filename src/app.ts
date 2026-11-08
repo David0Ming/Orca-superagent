@@ -4,6 +4,7 @@ import { Engine, key, latestAssignment, type ActorRef, type Candidate, type Exec
 import type { Store } from './store.ts'
 import type { FeishuConfig } from './feishu.ts'
 import { Projects, type TicketTarget } from './projects.ts'
+import { Attachments } from './attachments.ts'
 
 export interface Request { command: string[]; options: Record<string, string>; id: string }
 type Mail = OutboundMessage & { status: ReplyStatus; triggerId?: string }
@@ -16,9 +17,11 @@ const required = (options: Record<string, string>, key: string) => {
 
 export class App {
   readonly engine: Engine
+  readonly attachments: Attachments
   private routing?: Record<string, string>
   constructor(readonly store: Store, executor: Executor, readonly owner = String(userInfo().uid), readonly github?: GitHubConfig, readonly feishu?: FeishuConfig,
     readonly projects = new Projects(store), readonly githubSources: GitHubConfig[] = github ? [github] : []) {
+    this.attachments = new Attachments(store)
     const policy: Policy = {
       version: 'owner-only-v1', paused: false, evalTimeoutMs: 300_000,
       gate: trigger => this.isOwner(trigger.actor, trigger.meta) && trigger.human && this.inScope(trigger.source, trigger.meta)
@@ -203,6 +206,8 @@ export class App {
         executions: store.list<{ ticketId: string }>('execution').filter(item => ids.has(item.ticketId)), attempts: store.list<{ ticketId: string }>('execution-attempt').filter(item => ids.has(item.ticketId)) }
     }
     if (command === 'owner') {
+      if (action === 'attachment-write') return this.attachments.write(o)
+      if (action === 'attachment-read') return this.attachments.read(o)
       if (action === 'reevaluate') {
         const triggerId = required(o, 'trigger'), trigger = store.triggers.get(triggerId)
         if (!trigger?.human || !this.isOwner(trigger.actor, trigger.meta) || !this.inScope(trigger.source, trigger.meta)) throw new Error('Only in-scope owner requests may be reevaluated')
@@ -221,7 +226,8 @@ export class App {
         return this.projects.handle(['location', 'add'], { ...o, id, name, component: `repo-${id}`, repository: required(o, 'repository') })
       }
       if (action === 'request' || action === 'comment') {
-        const id = `panel:${required(o, 'id')}`, text = required(o, 'text')
+        const id = `panel:${required(o, 'id')}`, attachments = this.attachments.resolve(o.attachments), text = o.text ?? ''
+        if (!text.trim() && !attachments.length) throw new Error('Input text or a ready attachment is required')
         if (action === 'comment' && (!!o.ticket === !!o.trigger)) throw new Error('Comments require exactly one --ticket or --trigger')
         const existing = store.triggers.get(id)
         const topic = action === 'comment' && o.trigger ? store.triggers.get(o.trigger) : undefined
@@ -231,7 +237,7 @@ export class App {
         if (matches.length > 1) throw new Error('Request belongs to multiple tasks; select the task explicitly')
         if (existing && topic && existing.meta.topicTriggerId === topic.id) {
           const locations = o.locations?.split(',').map(id => id.trim()).filter(Boolean)
-          if (existing.text !== text || (o.project && (this.projects.handle(['project', 'show'], {id:o.project}) as {id:string}).id !== existing.meta.projectId) || (locations && JSON.stringify(locations) !== JSON.stringify(existing.meta.locationIds))) throw new Error('Input id already used with different content')
+          if (existing.text !== text || JSON.stringify(existing.meta.attachments ?? []) !== JSON.stringify(attachments) || (o.project && (this.projects.handle(['project', 'show'], {id:o.project}) as {id:string}).id !== existing.meta.projectId) || (locations && JSON.stringify(locations) !== JSON.stringify(existing.meta.locationIds))) throw new Error('Input id already used with different content')
           return {id, result: engine.receive(existing)}
         }
         const ticket = action === 'comment' ? o.ticket ? store.tickets.get(o.ticket) : matches[0] : undefined
@@ -246,7 +252,7 @@ export class App {
         const locationIds = selected ?? inherited
         if (locationIds?.length) this.projects.resolve({...(project ? {project: project.id} : {}), locations: locationIds.join(',')})
         const thread = topic?.threads[0]?.id ?? (ticket ? `task:${ticket.id}` : `request:${id}`)
-        const meta = { ...(project ? {projectId: project.id} : {}), ...(topic ? {topicTriggerId: topic.id, ...(typeof topic.meta.projectId === 'string' ? {entryProjectId: topic.meta.projectId} : {})} : ticket ? {ticketId: ticket.id} : {}), ...(locationIds ? {locationIds} : {}) }
+        const meta = { ...(project ? {projectId: project.id} : {}), ...(topic ? {topicTriggerId: topic.id, ...(typeof topic.meta.projectId === 'string' ? {entryProjectId: topic.meta.projectId} : {})} : ticket ? {ticketId: ticket.id} : {}), ...(locationIds ? {locationIds} : {}), ...(attachments.length ? {attachments} : {}) }
         const origin = ticket && store.triggers.get(ticket.origin.triggerId)
         const channel = topic?.channel ?? (origin && ['panel', 'router'].includes(origin.source) ? origin.channel : undefined) ?? { source: 'panel', thread, address: { ...(project ? {projectId: project.id} : {}), ...(!topic && ticket ? {ticketId: ticket.id} : {}) } }
         if (existing && (existing.text !== text || JSON.stringify(existing.meta) !== JSON.stringify(meta) || JSON.stringify(existing.channel) !== JSON.stringify(channel))) throw new Error('Input id already used with different content')
@@ -349,8 +355,10 @@ export class App {
         if (o.publish && (o.publish !== 'true' || !publishing || !publishingTargets.every(target => this.githubSources.some(config => config.repository === target.repository && config.owner.id === target.owner.id && config.owner.login === target.owner.login)))) throw new Error('Publishing requires --publish true and a configured GitHub repository')
         this.routing = routing
         try {
-          if (!source?.text?.trim()) throw new Error('Owner request text is missing')
-          const decision = engine.decide(trigger, { kind: 'accept', title: required(o, 'title'), scope: source.text, reason: o.reason ?? 'Owner request', ...(requestedTriggerId !== trigger ? {audit:{requestedTriggerId,topicTriggerId:trigger}} : {}), ...(o.name ? { name: o.name } : {}) })
+          const files = Array.isArray(source?.meta.attachments) ? source.meta.attachments : []
+          if (!source || (!source.text.trim() && !files.length)) throw new Error('Owner request text or attachments are missing')
+          const scope = source.text.trim() ? source.text : `[无文字的附件请求：${files.map(file => file.name).join('、')}]`
+          const decision = engine.decide(trigger, { kind: 'accept', title: required(o, 'title'), scope, reason: o.reason ?? 'Owner request', ...(requestedTriggerId !== trigger ? {audit:{requestedTriggerId,topicTriggerId:trigger}} : {}), ...(o.name ? { name: o.name } : {}) })
           if (o.publish && decision.ticketId) store.put('publish-authorization', decision.ticketId, { ...publishing, ...(publishingTargets.length > 1 ? {repositories: publishingTargets} : {}) })
           if (decision.ticketId && !existing && ['panel', 'router'].includes(source.source) && !source.meta.topicTriggerId) {
             const pending = new Set(store.threads.get(`${source.threads[0].source}:${source.threads[0].id}`)?.pending ?? [])

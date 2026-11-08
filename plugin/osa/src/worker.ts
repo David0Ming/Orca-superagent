@@ -48,7 +48,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('osa.call', async (input: any) => {
     const stateDir = await orca.settings.get('stateDir')
     if (typeof stateDir !== 'string' || !isAbsolute(stateDir)) throw new Error('请在 Orca 插件设置中填写 OSA 状态目录的绝对路径。')
-    const allowed = ['status', 'request', 'comment', 'project-add', 'repository-add', 'stop', 'retry', 'reevaluate', 'windows', 'window-link', 'window-observe', 'window-open']
+    const allowed = ['status', 'request', 'comment', 'project-add', 'repository-add', 'stop', 'retry', 'reevaluate', 'windows', 'window-link', 'window-observe', 'window-open', 'attachment-write', 'attachment-read']
     if (!allowed.includes(input.action)) throw new Error('不支持的操作')
     if (input.action !== 'status' && input.stateDir !== resolvePath(stateDir)) throw new Error('状态目录已改变，请刷新并确认连接后再操作。')
     return await new Promise((resolve, reject) => {
