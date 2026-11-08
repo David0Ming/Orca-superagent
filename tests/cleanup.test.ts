@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, test } from 'vitest'
@@ -30,27 +30,45 @@ let result;
 if(args[0]==='terminal') result={terminals:s.terminals};
 else if(args[1]==='show') result={worktree:{id:${JSON.stringify(id)},path:${JSON.stringify(work)}}};
 else if(args[1]==='list') result={worktrees:fs.existsSync(${JSON.stringify(work)})?[{id:${JSON.stringify(id)},path:${JSON.stringify(work)}}]:[]};
-else if(args[1]==='rm') {if(s.fail)process.exit(18);if(args.includes('--force'))throw Error('force forbidden');cp.execFileSync('git',['-C',${JSON.stringify(repo)},'worktree','remove',${JSON.stringify(work)}]);s.removes++;result={removed:true,branchRetained:true};}
+else if(args[1]==='rm') {if(s.fail)process.exit(18);if(args.includes('--force')||args.includes('--delete-branch'))throw Error('forced removal or branch deletion forbidden');cp.execFileSync('git',['-C',${JSON.stringify(repo)},'worktree','remove',${JSON.stringify(work)}]);s.removes++;result={removed:true,branchRetained:true};}
 fs.writeFileSync(p,JSON.stringify(s));if(s.drop && args[1]==='rm')process.exit(17);
 console.log(JSON.stringify({ok:true,result}));
 `,{mode:0o700})
   clean.push(()=>{store.close();rmSync(dir,{recursive:true,force:true})})
   const gate = new WorkspaceCleanup(store,cli), evidence = join(dir,'references.json')
   writeFileSync(evidence,JSON.stringify({directory:work,checkedAt:new Date().toISOString(),checks:['Isolated test repository, no deployed services or external references'],references:[]}))
-  await gate.references('t',(await gate.inspect('t')).referenceFingerprint,evidence,()=>{})
   return {dir,repo,work,store,gate,state,git,evidence}
 }
 
 test('cleanup preserves dirty and ignored artifacts and unresolved resources', async () => {
   const f=await fixture(); expect((await f.gate.inspect('t')).eligible).toBe(true)
-  for(const name of ['untracked','ignored']) {
+  for(const name of ['.gitignore','untracked','ignored']) {
     writeFileSync(join(f.work,name),'preserve')
     const report=await f.gate.inspect('t');expect(report.eligible).toBe(false)
     await expect(f.gate.remove('t',report.fingerprint,()=>{})).rejects.toThrow('blocked')
-    expect(existsSync(join(f.work,name))).toBe(true);rmSync(join(f.work,name))
+    expect(existsSync(join(f.work,name))).toBe(true)
+    if (name === '.gitignore') writeFileSync(join(f.work,name),'ignored\n')
+    else rmSync(join(f.work,name))
   }
   f.store.put('orca-assignment','a',{id:'a',ticketId:'t',finished:true,releaseState:'retained'})
   expect((await f.gate.inspect('t')).reasons.join(' ')).toContain('retained')
+})
+
+test('cleanup preserves unowned worktrees and open tickets with unresolved executors', async () => {
+  const f = await fixture(), owned = f.store.get<any>('orca-operation','worktree:t')
+  f.store.delete('orca-operation','worktree:t')
+  let check = await f.gate.inspect('t')
+  expect(check.reasons.join(' ')).toContain('Not a ticket-owned isolated worktree')
+  await expect(f.gate.remove('t',check.fingerprint,()=>{})).rejects.toThrow('blocked')
+  f.store.put('orca-operation','worktree:t',owned)
+  f.store.tickets.save({...f.store.tickets.get('t')!,ended:undefined})
+  f.store.put('orca-assignment','a',{id:'a',ticketId:'t',finished:false})
+  check = await f.gate.inspect('t')
+  expect(check.reasons).toContain('Business ticket is still open')
+  expect(check.reasons).toContain('Executor resources are unresolved')
+  await expect(f.gate.remove('t',check.fingerprint,()=>{})).rejects.toThrow('blocked')
+  expect(existsSync(f.work)).toBe(true)
+  expect(JSON.parse(readFileSync(f.state,'utf8')).removes).toBe(0)
 })
 
 test('cleanup revalidates inventory and authorization, removes without force, and preserves audit records', async () => {
@@ -71,11 +89,11 @@ test('lost removal response reconciles inventory without issuing another deletio
   await expect(f.gate.remove('t',report.fingerprint,()=>{})).rejects.toThrow()
   expect(f.store.get<any>('workspace-cleanup','t').state).toBe('unknown')
   expect(await f.gate.remove('t',report.fingerprint,()=>{})).toMatchObject({state:'removed'})
+  expect(JSON.parse(readFileSync(f.state,'utf8')).removes).toBe(1)
 })
 
-test('cleanup retains unmerged commits, terminals and a continuing ticket reference', async () => {
-  const f=await fixture();writeFileSync(join(f.work,'code'),'change');execFileSync('git',['-C',f.work,'add','.']);execFileSync('git',['-C',f.work,'commit','-qm','change'])
-  expect((await f.gate.inspect('t')).reasons.join(' ')).toContain('commits')
+test('cleanup retains terminals and a continuing ticket reference', async () => {
+  const f=await fixture()
   writeFileSync(f.state,JSON.stringify({terminals:[{handle:'human'}],removes:0}))
   expect((await f.gate.inspect('t')).reasons.join(' ')).toContain('terminals')
   const next={...f.store.tickets.get('t')!,id:'next',ended:undefined,execution:undefined}
@@ -83,18 +101,38 @@ test('cleanup retains unmerged commits, terminals and a continuing ticket refere
   expect((await f.gate.inspect('t')).reasons.join(' ')).toContain('references')
 })
 
-test('clean Git state cannot substitute for runtime reference evidence or release a persistent workline', async () => {
+test('explicit cleanup removes committed worktrees without baseline or reference proof and retains the branch', async () => {
   const f = await fixture()
-  f.store.delete('workspace-reference-check','t')
-  expect((await f.gate.inspect('t')).reasons.join(' ')).toContain('unverified')
+  writeFileSync(join(f.work,'code'),'committed result')
+  execFileSync('git',['-C',f.work,'add','.'])
+  execFileSync('git',['-C',f.work,'commit','-qm','result'])
+  const head = execFileSync('git',['-C',f.work,'rev-parse','HEAD'],{encoding:'utf8'}).trim()
+  expect((await f.gate.inspect('t')).eligible).toBe(true)
+  f.store.delete('workspace-baseline','t')
+  f.store.put('knowledge','k',{summary:'Historical result at '+f.work})
+  f.store.put('handoff','t',{ticketId:'t',evidence:f.work+'/code'})
   const check = await f.gate.inspect('t')
-  writeFileSync(f.evidence, JSON.stringify({directory:f.work, checkedAt:new Date().toISOString(),checks:['systemd mounts'],references:['archive.service']}))
-  await expect(f.gate.references('t',check.referenceFingerprint,f.evidence,()=>{})).rejects.toThrow('empty references')
+  expect(check.eligible).toBe(true)
+  expect(await f.gate.remove('t',check.fingerprint,()=>{})).toMatchObject({state:'removed',receipt:{branchRetained:true}})
+  expect(existsSync(f.work)).toBe(false)
+  expect(f.git('rev-parse','task')).toBe(head)
+  expect(f.git('show','task:code')).toBe('committed result')
+  expect(f.store.get<any>('handoff','t').evidence).toBe(f.work+'/code')
+  expect(f.store.get<any>('knowledge','k').summary).toContain(f.work)
+})
+
+test('reference assessments are optional evidence without an expiry or empty-reference gate', async () => {
+  const f = await fixture(), before = await f.gate.inspect('t')
+  expect(before.eligible).toBe(true)
+  writeFileSync(f.evidence, JSON.stringify({directory:f.work, checkedAt:'2020-01-01T00:00:00.000Z',checks:['Historical service inventory'],references:['archive.service']}))
+  await f.gate.references('t',before.referenceFingerprint,f.evidence,()=>{})
+  expect((await f.gate.inspect('t')).fingerprint).toBe(before.fingerprint)
+  rmSync(f.evidence)
+  expect((await f.gate.inspect('t')).eligible).toBe(true)
   f.store.put('goal','g',{id:'g',name:'Recovery'})
   f.store.put('task-plan','t',{goalId:'g'})
   expect((await f.gate.inspect('t')).reasons.join(' ')).toContain('Persistent workline')
 })
-
 
 test('failed-before-removal can be explicitly reset after intact inventory verification, then retried', async () => {
   const f=await fixture();writeFileSync(f.state,JSON.stringify({terminals:[],removes:0,fail:true}))
@@ -117,13 +155,10 @@ test('ended continuations inherit cleanup ownership without historical dependenc
   f.store.tickets.save(next); f.store.put('ticket-target','next',{...f.store.get<any>('ticket-target','t'),ticketId:'next'})
   f.store.put('task-plan','next',{ticketId:'next',continueFrom:'t',dependsOn:['t'],resources:[],priority:0,createdAt:'now'})
   f.store.put('orca-assignment','b',{id:'b',ticketId:'next',finished:true,releaseState:'released'})
-  await f.gate.references('next',(await f.gate.inspect('next')).referenceFingerprint,f.evidence,()=>{})
   expect((await f.gate.inspect('next')).eligible).toBe(true)
-  await f.gate.references('t',(await f.gate.inspect('t')).referenceFingerprint,f.evidence,()=>{})
   expect((await f.gate.inspect('t')).eligible).toBe(true)
   f.store.put('handoff','next',{ticketId:'next',evidence:f.work+'/result.txt'})
-  expect((await f.gate.inspect('next')).eligible).toBe(false)
-  f.store.delete('handoff','next')
+  expect((await f.gate.inspect('next')).eligible).toBe(true)
   expect(await f.gate.remove('next',(await f.gate.inspect('next')).fingerprint,()=>{})).toMatchObject({state:'removed'})
   expect(existsSync(f.work)).toBe(false)
 })

@@ -186,7 +186,8 @@ describe('Store', () => {
     expect(store.routerNotices()).toEqual([])
     store.put('orca-assignment', 'worker', {settled:'done'})
     expect(store.routerNotices()).toEqual([expect.objectContaining({kind:'inputs',inputIds:['followup']})])
-    store.put('input-resolution', 'followup', {summary:'Handled'})
+    row.inputs[0] = {...row.inputs[0], readAt:at} as any
+    store.tickets.save(row)
     expect(store.routerNotices()).toEqual([])
   })
 

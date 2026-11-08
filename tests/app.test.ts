@@ -327,11 +327,10 @@ test('shared chat is only a reply address; explicit attachment preserves the ori
   expect(context.triggers.some((trigger:any) => trigger.text === 'Logged in, continue phase two')).toBe(true)
   expect(context.scopeRevisions).toHaveLength(0)
   expect(f.store.tickets.list().filter(t=>t.id!==ticket.id).every(t=>t.inputs.length===0)).toBe(true)
-  expect(()=>f.call(['report','ready'],{...auth,summary:'Done'})).toThrow('Unprocessed')
-  f.call(['ack'],{...auth,inputs:input})
-  expect(()=>f.call(['report','ready'],{...auth,summary:'Done'})).toThrow('Unprocessed')
-  f.call(['report','ready'],{...auth,inputs:input,summary:'Phase two completed and verified'})
-  expect(f.store.get<any>('input-resolution',input).summary).toContain('Phase two')
+  expect(context.ticket.inputs[0].readAt).toBeTruthy()
+  f.call(['report','ready'],{...auth,summary:'Phase two completed and verified'})
+  expect(f.store.get('input-resolution',input)).toBeUndefined()
+  expect(f.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
   expect(f.store.list<any>('outbox')[0].channel.thread).toBe('management-chat')
 })
 
@@ -384,7 +383,7 @@ test('ordinary progress remains readable without waking Router', () => {
 })
 
 
-test('scope correction invalidates an earlier read even before the followup is acknowledged', () => {
+test('late followup is released by the core rather than rejecting the completion report', () => {
   const f=setup(); f.call(['intake'],{id:'original',text:'Stage one'})
   const {ticketId}=f.call(['route','accept'],{trigger:'original',title:'Stages',scope:'Only stage one'})
   const assignment=f.store.tickets.get(ticketId)!.assignments[0].id, auth={ticket:ticketId,assignment,token:'test'}
@@ -392,7 +391,9 @@ test('scope correction invalidates an earlier read even before the followup is a
   f.call(['read'],auth)
   f.call(['intake'],{id:'new-scope',text:'Continue stage two'})
   f.call(['route','attach'],{ticket:ticketId,trigger:'new-scope',scope:'Both stages authorized'})
-  expect(()=>f.call(['report','ready'],{...auth,summary:'Stage one done'})).toThrow('Read the current')
+  expect(()=>f.call(['report','ready'],{...auth,summary:'Stage one done'})).not.toThrow()
+  expect(f.store.tickets.get(ticketId)?.mandate.scope).toBe('Stage one')
+  expect(f.store.threads.list().some(thread => thread.pending.includes('new-scope'))).toBe(true)
 })
 
 
@@ -470,12 +471,12 @@ test('invalid panel submissions retain the exact original and reason without wro
   expect(() => f.app.handle({command:['owner','status'],options:[] as any,id:'invalid'})).toThrow('Invalid request')
 })
 
-test('publish with explicit continuation is rejected before accepting work', () => {
-  const f=setup(), config={repository:'owner/project',owner:{id:'42',login:'owner'}}, app=new App(f.store,f.executor,'owner',config)
-  const call=(command:string[],options:Record<string,string>)=>app.handle({command,options:{lease:f.store.get<any>('router','lease').token,...options},id:'rpc'}) as any
-  call(['intake'],{id:'publish',text:'Publish this change'})
-  expect(() => call(['route','accept'],{trigger:'publish',title:'Publish',publish:'true','continue-from':'prior'})).toThrow('cannot continue')
-  expect(f.store.tickets.list()).toHaveLength(0)
+test('publish option records no extra permission and does not forbid existing-directory placement', () => {
+  const f=setup()
+  f.call(['intake'],{id:'publish',text:'Publish this change under the project delivery rules'})
+  const result=f.call(['route','accept'],{trigger:'publish',title:'Publish',publish:'true',workspace:'inspect'})
+  expect(f.store.tickets.get(result.ticketId)?.mandate.scope).toBe('Publish this change under the project delivery rules')
+  expect(f.store.get('publish-authorization',result.ticketId)).toBeUndefined()
 })
 
 
@@ -862,4 +863,26 @@ test('partial or unreadable attachments cannot be submitted or returned as succe
   expect(()=>f.call(['owner','request'],{id:'unreadable',project:'p',text:'Read this',attachments:JSON.stringify([id])})).toThrow()
   expect(f.store.list('core.trigger')).toHaveLength(0)
   expect(f.call(['owner','status']).rejectedSubmissions).toEqual(expect.arrayContaining([expect.objectContaining({id:'unreadable',text:'Read this',error:expect.any(String)})]))
+})
+
+
+test('ready uses DSH read and release semantics without requiring per-input forms', () => {
+  vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-08T00:00:00Z'))
+  const f=setup()
+  f.call(['intake'],{id:'original',text:'Fix the bug'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'original',title:'Fix'})
+  const assignment=f.store.tickets.get(ticketId)!.assignments[0].id
+  f.app.engine.assignmentStarted(ticketId,assignment); f.store.put('capability',assignment,{token:'test'})
+  const auth={ticket:ticketId,assignment,token:'test'}
+  f.call(['intake'],{id:'read-followup',text:'Use the existing project rules'})
+  f.call(['route','attach'],{ticket:ticketId,trigger:'read-followup'})
+  f.call(['read'],auth)
+  vi.advanceTimersByTime(10)
+  f.call(['intake'],{id:'late-followup',text:'Also investigate this separate issue'})
+  f.call(['route','attach'],{ticket:ticketId,trigger:'late-followup'})
+  vi.advanceTimersByTime(10)
+  f.call(['report','ready'],{...auth,summary:'Original bug fixed'})
+  expect(f.store.threads.list().some(thread => thread.pending.includes('read-followup'))).toBe(false)
+  expect(f.store.threads.list().some(thread => thread.pending.includes('late-followup'))).toBe(true)
+  expect(f.store.tickets.get(ticketId)?.ended?.outcome).toBe('completed')
 })

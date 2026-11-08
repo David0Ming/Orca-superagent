@@ -73,7 +73,7 @@ owner retry --ticket TICKET
 
 GitHub 来源与项目仓库通过现有 component 的 GitHub 字段关联；面板不要求使用者管理组件层级，外部来源高级配置仍用现有命令和启动参数。改配置不等于已运行的会话更新了提示词。
 
-Router 对明确授权的发布使用 `route accept --publish true`。Executor 的 `pr publish --location LOCATION` 逐仓发布，校验目标、账号和干净的已提交工作区；`ready` 核对当前提交的发布记录。不会自动合并、部署或推送未授权任务。
+发布依据原始授权和项目交付规则；旧 `--publish` 参数仅兼容，不授予或撤销权限。Executor 可用 `pr publish --location LOCATION` 逐仓发布，也可使用项目已有工具；辅助接口校验目标、账号和分支。`ready` 沿用 DSH 报告与 PR 跟踪，不要求 OSA 专有发布回执。不会因此自动合并、部署或推送未授权任务。
 
 ## 停止、恢复与限制
 

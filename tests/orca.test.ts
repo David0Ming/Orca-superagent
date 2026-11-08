@@ -965,12 +965,44 @@ it('regression: owner cancellation during workspace preparation prevents new wor
 
 it('inspection reuses the registered directory and never creates or renames a worktree', async () => {
   const f = registryFixture(2)
+  f.ticket.mandate.scope = '清理这个仓库里已确认无用的临时文件'
+  f.store.tickets.save(f.ticket)
   f.projects.handle(['task','plan'], {ticket:f.ticket.id, workspace:'inspect'})
   f.executor.start(f.ticket, f.assignment); await f.tick()
   expect(f.state().worktrees).toHaveLength(0)
   expect(f.store.tickets.get(f.ticket.id)?.execution?.directory).toBe(realpathSync(f.dir))
-  expect(f.calls().find(c=>c.args[1]==='worker-start').args.join(' ')).toContain('Do not change its code')
+  const spec = f.calls().find(c=>c.args[1]==='worker-start').args.join(' ')
+  expect(spec).toContain(f.ticket.mandate.scope)
+  expect(spec).not.toContain('Do not change its code')
+  expect(spec).not.toContain('unknown reference inventory is not permission')
   expect(()=>f.projects.handle(['task','plan'],{ticket:f.ticket.id,workspace:'isolated'})).toThrow('frozen')
+})
+
+
+it('preserves an owner request for read-only inspection', async () => {
+  const f = registryFixture()
+  f.ticket.mandate.scope = '仅查看仓库，不要修改任何文件'
+  f.store.tickets.save(f.ticket)
+  f.projects.handle(['task','plan'], {ticket:f.ticket.id, workspace:'inspect'})
+  f.executor.start(f.ticket, f.assignment); await f.tick()
+  const spec = f.calls().find(c=>c.args[1]==='worker-start').args.join(' ')
+  expect(spec).toContain(f.ticket.mandate.scope)
+  expect(spec).toContain('follow any read-only limits in the owner')
+})
+
+it('continues an ended inspect task in the registered repository', async () => {
+  const f = registryFixture(2)
+  f.projects.handle(['task','plan'], {ticket:f.ticket.id, workspace:'inspect'})
+  f.executor.start(f.ticket, f.assignment); await f.tick()
+  f.engine.report(f.ticket.id,{state:'ready',summary:'Done'}); f.done(); await f.tick()
+  const next = f.queue('continuation','legacy')
+  f.projects.handle(['task','plan'],{ticket:next.id,'continue-from':f.ticket.id})
+  await f.tick()
+  expect(f.state().worktrees).toHaveLength(0)
+  expect(f.store.tickets.get(next.id)?.execution?.directory).toBe(realpathSync(f.dir))
+  const starts = f.calls().filter(c=>c.args[1]==='worker-start')
+  expect(starts).toHaveLength(2)
+  expect(starts[1].args.join(' ')).not.toContain('Do not change its code')
 })
 
 it('an ended ticket can hand off its directory to a separately identified continuation', async () => {
@@ -980,6 +1012,7 @@ it('an ended ticket can hand off its directory to a separately identified contin
   const previous = f.store.tickets.get(f.ticket.id)!
   const next = f.queue('continuation','legacy')
   f.projects.handle(['task','plan'],{ticket:next.id,'continue-from':previous.id})
+  f.update({ terminals: [...f.state().terminals, { handle: 'unrelated', worktree: 'path:' + previous.execution!.directory }] })
   await f.tick()
   expect(f.state().worktrees).toHaveLength(1)
   expect(f.store.tickets.get(next.id)?.execution?.directory).toBe(previous.execution?.directory)

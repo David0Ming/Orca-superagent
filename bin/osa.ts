@@ -72,19 +72,7 @@ async function serve() {
   let executor: OrcaExecutor
   let wake: RouterWake, cleanup: WorkspaceCleanup, windows: Windows
   const publishers = new Map<string, Publisher>()
-  const report = async (request: Request) => {
-    if (!app.store.get('report-receipt', request.id) && request.command[1] === 'ready') {
-      const ticket = app.executorTicket(request.options)
-      const authorization = app.store.get<GitHubConfig & {repositories?: GitHubConfig[]}>('publish-authorization', ticket.id)
-      for (const target of authorization?.repositories ?? (authorization ? [authorization] : [])) {
-        const publisher = publishers.get(target.repository)
-        if (!publisher) throw new Error(`Publishing is not configured for ${target.repository}`)
-        const location = app.projects.targets(ticket.id).find(location => location.github?.repository === target.repository)
-        await publisher.assertPublished(ticket.id, request.options.assignment, location?.locationId)
-      }
-    }
-    return app.acceptReport(request)
-  }
+  const report = async (request: Request) => app.acceptReport(request)
   const server = createServer(socket => {
     socket.setEncoding('utf8')
     let data = ''

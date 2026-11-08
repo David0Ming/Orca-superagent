@@ -43,12 +43,6 @@ export class Projects {
       if (github && legacyComponent && !legacyComponent.github) this.store.put('component', 'legacy', { ...legacyComponent, github, updatedAt: now() })
       for (const ticket of this.store.tickets.list()) {
         if (!previous && !this.store.get('ticket-target', ticket.id)) this.bind(ticket, { project: 'legacy', component: 'legacy', location: 'legacy' })
-        const target = this.store.get<TicketTarget>('ticket-target', ticket.id)
-        const authorization = this.store.get<{ repository: string; owner?: GitHubConfig['owner'] }>('publish-authorization', ticket.id)
-        if (target?.projectId === 'legacy' && authorization && !authorization.owner) {
-          if (!github || authorization.repository !== github.repository || target.github?.repository !== github.repository) throw new Error('Legacy publish authorization repository mismatch; explicit owner confirmation required')
-          this.store.put('publish-authorization', ticket.id, { ...authorization, owner: github.owner })
-        }
       }
     })
   }

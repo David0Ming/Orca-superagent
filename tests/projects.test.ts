@@ -109,17 +109,17 @@ it('keeps goal child completion separate from an explicit joint acceptance task'
   const late = f.ticket('late','a')
   expect(() => f.projects.handle(['task','plan'],{ticket:late.id,goal:'g'})).toThrow('frozen')
 })
-it('upgrades old publish authorization only after matching its legacy repository and owner', () => {
+it('preserves obsolete publish records without using them as a migration gate', () => {
   const f = fixture(); const ticket = f.ticket('old', 'unused')
   const github = { repository: 'owner/repository', owner: { id: '42', login: 'owner' } }
   f.store.put('publish-authorization', ticket.id, { repository: github.repository })
   f.projects.ensureLegacy(f.dir, github)
-  expect(f.store.get('publish-authorization', ticket.id)).toEqual(github)
+  expect(f.store.get('publish-authorization', ticket.id)).toEqual({repository:github.repository})
   f.projects.ensureLegacy(f.dir, github)
   const bad = fixture(); const other = bad.ticket('old', 'unused')
   bad.store.put('publish-authorization', other.id, { repository: 'unrelated/repository' })
-  expect(() => bad.projects.ensureLegacy(bad.dir, github)).toThrow('authorization repository mismatch')
-  expect(bad.store.get('ticket-target', other.id)).toBeUndefined()
+  expect(() => bad.projects.ensureLegacy(bad.dir, github)).not.toThrow()
+  expect(bad.store.get('ticket-target', other.id)).toBeDefined()
   expect(bad.store.get<any>('publish-authorization', other.id).owner).toBeUndefined()
 })
 

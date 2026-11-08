@@ -108,10 +108,12 @@ export class App {
     }
     if (['read', 'ack', 'acknowledge', 'report', 'thread', 'handback', 'memo'].includes(command)) {
       const id = required(o, 'ticket'), assignment = required(o, 'assignment')
-      const ticket = this.executorTicket(o)
+      let ticket = this.executorTicket(o)
       if (command === 'read') {
-        store.put('executor-read', assignment, { scope: ticket.mandate.scope, inputs: ticket.inputs.map(i => i.id) })
-        return { processingProtocol: 'ticket.mandate.scope is the immutable original mandate; inputs and triggers preserve subsequent owner words and their sources. Interpret owner corrections without Router-authored plans. After ack, report --inputs with how each owner followup was handled. Read again before ready. Never bind the parent service Run as your child coordinator Run.', inputResolutions: ticket.inputs.map(input => store.get('input-resolution', input.id)).filter(Boolean), scopeRevisions: store.list<{ticketId: string}>('scope-revision').filter(r => r.ticketId === id), ticket, context: this.projects.context(id), contextFile: this.projects.brief(id), triggers: [...new Set([...ticket.origin.triggerIds, ...ticket.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])])].map(id => store.triggers.get(id)) }
+        engine.inputsDelivered(id, assignment, ticket.inputs.map(input => input.id))
+        engine.inputsRead(id, ticket.inputs.map(input => input.id))
+        ticket = store.tickets.get(id)!
+        return { processingProtocol: 'ticket.mandate.scope is the immutable original mandate; inputs and triggers preserve subsequent owner words and their sources. Interpret owner corrections without Router-authored plans. Current OSA execution rules: workspace modes select a directory, not permissions. Any older OSA-generated inspect-mode prohibition on local edits is withdrawn; owner or project read-only restrictions still apply. Publishing follows the original authorization and delivery rules, not a Router publish flag. Read the original inputs, handle in-scope followups and hand back out-of-scope requests. Reports and answers use the core ticket lifecycle; --inputs is optional historical bookkeeping. Never bind the parent service Run as your child coordinator Run.', inputResolutions: ticket.inputs.map(input => store.get('input-resolution', input.id)).filter(Boolean), scopeRevisions: store.list<{ticketId: string}>('scope-revision').filter(r => r.ticketId === id), ticket, context: this.projects.context(id), contextFile: this.projects.brief(id), triggers: [...new Set([...ticket.origin.triggerIds, ...ticket.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])])].map(id => store.triggers.get(id)) }
       }
       if (command === 'memo') {
         if (action !== 'list' && (ticket.ended || latestAssignment(ticket)?.state !== 'running')) throw new Error('Memo writes require the current running assignment')
@@ -122,12 +124,8 @@ export class App {
         if (!['ready', 'blocked', 'dropped', 'failed', 'progress', 'waiting'].includes(action)) throw new Error('Invalid report state')
         const summary = required(o, 'summary')
         if (ticket.ended && latestAssignment(ticket)?.report?.state === action && latestAssignment(ticket)?.report?.summary === summary) return ticket
-        const read = store.get<{scope: string; inputs: string[]}>('executor-read', assignment)
-        if (action === 'ready' && (!read || read.scope !== ticket.mandate.scope || JSON.stringify(read.inputs) !== JSON.stringify(ticket.inputs.map(i => i.id)))) throw new Error('Read the current ticket scope and inputs before reporting ready')
         const processed = o.inputs?.split(',') ?? []
         if (processed.some(inputId => !ticket.inputs.some(input => input.id === inputId && (input.kind !== 'trigger' || input.readAt)))) throw new Error('Report inputs must belong to the ticket and be read first')
-        const unresolved = ticket.inputs.filter(input => input.kind === 'trigger' && input.human && !input.context && this.isOwner(store.triggers.get(input.triggerId)?.actor ?? {source: '', id: ''}) && !processed.includes(input.id) && !store.get('input-resolution', input.id))
-        if (action === 'ready' && unresolved.length) throw new Error('Unprocessed owner inputs remain; read, ack and report --inputs with their disposition before ready')
         for (const inputId of processed) store.put('input-resolution', inputId, { inputId, ticketId: id, assignmentId: assignment, state: action, summary })
         const result = engine.report(id, { state: action as 'ready', summary, ...(o.question !== undefined ? { question: o.question.trim() || null } : {}), ...(o['asked-by'] ? { askedBy: o['asked-by'] } : {}), ...(o.answers ? { answers: o.answers } : {}) })
         if (result.attention && ticket.channels.some(channel => channel.source === 'panel')) engine.reply({purpose: 'attention', ticketId: id, question: result.attention.question, text: result.attention.question})
@@ -198,7 +196,7 @@ export class App {
           const assignment = latestAssignment(ticket), execution = assignment && store.get<{nativeState?: string}>('execution', assignment.id)
           return { ticketId: ticket.id, businessState: ticket.ended?.outcome ?? assignment?.report?.state ?? 'pending', report: assignment?.report,
             executionState: execution?.nativeState ?? 'unknown', handoff: store.get('handoff', ticket.id),
-            pendingInputIds: ticket.inputs.filter(i => i.kind === 'trigger' && i.human && !i.context && !store.get('input-resolution', i.id)).map(i => i.id),
+            pendingInputIds: ticket.inputs.filter(i => i.kind === 'trigger' && i.human && !i.context && !i.readAt).map(i => i.id),
             queue: store.get('notice', `queue:${ticket.id}`) }
         }), notices: store.list<{ ticketId?: string; archivedAt?: string }>('notice').filter(item => !item.archivedAt && (!o.project || !item.ticketId || ids.has(item.ticketId))),
         historicalNotices: store.list<{archivedAt?:string}>('notice').filter(item => item.archivedAt),
@@ -348,18 +346,12 @@ export class App {
           : store.list('project').length ? this.projects.resolve(routing, source?.source === 'github' ? String(source.meta.repository) : undefined) : undefined
         if (o.name && store.tickets.list().some(ticket => ticket.execution?.name === o.name && ticket.origin.triggerId !== trigger
           && store.get<{ repository: string }>('ticket-target', ticket.id)?.repository === target?.repository)) throw new Error('Ticket name already in use in this repository')
-        const publishingTargets = target ? (target.repositories ?? [target]).flatMap(target => target.github ? [target.github] : []) : this.github ? [this.github] : []
-        const publishing = publishingTargets[0]
-        if (o.publish && (o['continue-from'] || (existing && store.get<{continueFrom?: string}>('task-plan', existing.id)?.continueFrom))) throw new Error('Publishing cannot continue another task workspace; use an isolated workspace')
-        if (o.publish && (o.workspace === 'inspect' || (existing && store.get<{workspace?: string}>('task-plan', existing.id)?.workspace === 'inspect'))) throw new Error('Inspection tasks cannot publish')
-        if (o.publish && (o.publish !== 'true' || !publishing || !publishingTargets.every(target => this.githubSources.some(config => config.repository === target.repository && config.owner.id === target.owner.id && config.owner.login === target.owner.login)))) throw new Error('Publishing requires --publish true and a configured GitHub repository')
         this.routing = routing
         try {
           const files = Array.isArray(source?.meta.attachments) ? source.meta.attachments : []
           if (!source || (!source.text.trim() && !files.length)) throw new Error('Owner request text or attachments are missing')
           const scope = source.text.trim() ? source.text : `[无文字的附件请求：${files.map(file => file.name).join('、')}]`
           const decision = engine.decide(trigger, { kind: 'accept', title: required(o, 'title'), scope, reason: o.reason ?? 'Owner request', ...(requestedTriggerId !== trigger ? {audit:{requestedTriggerId,topicTriggerId:trigger}} : {}), ...(o.name ? { name: o.name } : {}) })
-          if (o.publish && decision.ticketId) store.put('publish-authorization', decision.ticketId, { ...publishing, ...(publishingTargets.length > 1 ? {repositories: publishingTargets} : {}) })
           if (decision.ticketId && !existing && ['panel', 'router'].includes(source.source) && !source.meta.topicTriggerId) {
             const pending = new Set(store.threads.get(`${source.threads[0].source}:${source.threads[0].id}`)?.pending ?? [])
             const related = store.list<Trigger>('core.trigger').filter(input => input.meta.topicTriggerId === source.id && pending.has(input.id) && !store.triggers.disposition(input.id)?.fanout.length)

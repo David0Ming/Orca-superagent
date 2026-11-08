@@ -23,23 +23,6 @@ export class Publisher {
     return promise
   }
 
-  async assertPublished(ticketId: string, assignment: string, location?: string): Promise<void> {
-    const ticket = this.store.tickets.get(ticketId), projects = new Projects(this.store), targets = projects.targets(ticketId)
-    if (!ticket || latestAssignment(ticket)?.id !== assignment) throw new Error('Publication does not belong to the current assignment')
-    if (targets.length > 1 && !location) throw new Error('Select --location for a multi-repository publication')
-    const target = location ? targets.find(target => target.locationId === location) : targets[0]
-    if ((location && !target) || (target && target.github?.repository !== this.config.repository)) throw new Error('Publisher does not match ticket target')
-    const workspace = target && projects.workspaces(ticketId).find(workspace => workspace.locationId === target.locationId)
-    const directory = workspace?.directory ?? (targets.length < 2 ? ticket.execution?.directory : undefined)
-    if (!directory) throw new Error('Publication workspace is unavailable')
-    const git = async (...args: string[]) => (await execute('git', ['-C', directory, ...args], {timeout: 60_000, maxBuffer: 8 * 1024 * 1024})).stdout.trim()
-    if (await git('status', '--porcelain')) throw new Error('Commit and publish current changes before reporting ready')
-    const sha = await git('rev-parse', 'HEAD'), id = targets.length > 1 ? `${ticketId}:${target!.locationId}:${sha}` : `${ticketId}:${sha}`
-    const publication = this.store.get<{ticketId?: string; repository?: string; sha: string; pr?: number}>('publication', id)
-    if (!publication?.pr || publication.sha !== sha || (publication.ticketId && publication.ticketId !== ticketId) || (publication.repository && publication.repository !== this.config.repository)
-      || !ticket.follows?.some(follow => follow.own && follow.thread === `github:${this.config.repository}:${publication.pr}`)) throw new Error(`Publish the current commit for ${this.config.repository} before reporting ready`)
-  }
-
   private async api(path: string, fields?: Record<string, string>): Promise<any> {
     const args = ['api', '--hostname', 'github.com', path]
     if (fields) { args.push('--method', 'POST'); for (const [key, value] of Object.entries(fields)) args.push('-f', `${key}=${value}`) }
@@ -62,19 +45,19 @@ export class Publisher {
       if (target && (current?.ticketId !== ticketId || target.kind !== 'git' || target.hostId !== 'local'
         || !isAbsolute(target.repository) || target.github?.repository !== repository
         || target.github.owner.id !== owner.id || target.github.owner.login !== owner.login)) throw new Error('Publisher does not match ticket target')
-      const authorization = this.store.get<GitHubConfig & {repositories?: GitHubConfig[]}>('publish-authorization', ticketId)
-      const authorized = authorization?.repositories ?? (authorization ? [authorization] : [])
-      if (!authorized.some(item => item.repository === repository && (!current || (item.owner?.id === owner.id && item.owner.login === owner.login))))
-        throw new Error('Owner has not authorized publishing this ticket target')
     }
     assertTarget()
     const plan = this.store.get<{workspace?: string; continueFrom?: string}>('task-plan', ticketId)
-    if (plan?.workspace === 'inspect' || plan?.continueFrom) throw new Error('Publishing requires a ticket-owned isolated branch')
     if (!title.trim() || !body.trim()) throw new Error('PR title and body are required')
-    const workspace = target && projects.workspaces(ticketId).find(workspace => workspace.locationId === target.locationId)
-    const directory = workspace?.directory ?? (!target || targets.length === 1 ? ticket.execution?.directory : undefined), branch = workspace?.name ?? (!target || targets.length === 1 ? ticket.execution?.name : undefined)
-    if (!directory || !branch || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(branch)) throw new Error('Invalid ticket workspace')
+    const workspaceOwner = projects.workspaceOwner(ticketId)
+    const workspace = target && [...projects.workspaces(ticketId), ...projects.workspaces(workspaceOwner)].find(workspace => workspace.locationId === target.locationId)
+    const execution = this.store.tickets.get(workspaceOwner)?.execution
+    const directory = (target && projects.directory(ticketId, target.locationId)) || workspace?.directory || (!target || targets.length === 1 ? execution?.directory : undefined)
+    if (!directory) throw new Error('Invalid ticket workspace')
     const git = async (...args: string[]) => (await execute('git', ['-C', directory, ...args], { timeout: 60_000, maxBuffer: 8 * 1024 * 1024 })).stdout.trim()
+    const branch = plan?.workspace === 'inspect' || plan?.continueFrom ? await git('branch', '--show-current') : workspace?.name ?? execution?.name
+    if (!branch) throw new Error('Invalid ticket workspace')
+    await git('check-ref-format', '--branch', branch)
     if (target) {
       const root = await realpath(target.repository)
       const targetGit = async (...args: string[]) => (await execute('git', ['-C', root, ...args])).stdout.trim()

@@ -232,10 +232,7 @@ export class GitHub {
           if (thread) this.store.threads.save({...thread, meta: {...thread.meta, prState: {state: 'closed', outcome, at}}})
           // Historical PRs cannot settle a new multi-repository round; polling replays closure after its current ready report.
           const incomplete = tickets.some(ticket => {
-            const authorization = this.store.get<{repositories?: {repository: string}[]}>('publish-authorization', ticket.id)
-            const multiRepository = new Projects(this.store).targets(ticket.id).length > 1 || (authorization?.repositories?.length ?? 0) > 1
-            return (multiRepository && latestAssignment(ticket)?.report?.state !== 'ready') || authorization?.repositories?.some(target =>
-              !ticket.follows?.some(follow => follow.own && follow.thread.startsWith(`github:${target.repository}:`)))
+            return new Projects(this.store).targets(ticket.id).length > 1 && latestAssignment(ticket)?.report?.state !== 'ready'
           })
           if (!incomplete) engine.threadClosed(this.ref(number), outcome, at)
         })

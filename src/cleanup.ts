@@ -8,7 +8,7 @@ import { Projects, type TicketTarget } from './projects.ts'
 const execute = promisify(execFile)
 type Cleanup = { ticketId: string; directory: string; state: 'removing' | 'unknown' | 'removed' | 'reset'; fingerprint: string; referenceFingerprint?: string; receipt?: unknown; error?: string }
 
-/** Explicit, non-forced removal of proven, unused framework worktrees. */
+/** Explicit, non-forced removal of unused framework worktrees. */
 export class WorkspaceCleanup {
   private readonly active = new Map<string, Promise<unknown>>()
   constructor(private readonly store: Store, private readonly cli: string) {}
@@ -24,7 +24,7 @@ export class WorkspaceCleanup {
   async inspect(ticketId: string) {
     const ticket = this.store.tickets.get(ticketId), target = this.store.get<TicketTarget>('ticket-target', ticketId)
     if (!ticket || !target || target.hostId !== 'local' || target.kind !== 'git') throw new Error('Cleanup requires a registered local Git ticket')
-    const unchanged = () => JSON.stringify([this.store.tickets.list(), this.store.list('task-plan'), this.store.list('ticket-target'), this.store.list('orca-assignment'), this.store.list('goal'), this.store.list('knowledge'), this.store.list('workspace-reference-check')])
+    const unchanged = () => JSON.stringify([this.store.tickets.list(), this.store.list('task-plan'), this.store.list('ticket-target'), this.store.list('orca-assignment'), this.store.list('goal')])
     const revision = unchanged()
     const directory = ticket.execution?.directory
     const reasons: string[] = []
@@ -38,11 +38,9 @@ export class WorkspaceCleanup {
     if (!bindings.length || bindings.some(b => !b.finished)) reasons.push('Executor resources are unresolved')
     if (bindings.some(b => (b.releaseState ?? this.store.get<any>('orca-operation', `release:${b.id}:${b.dispatchId}`)?.response?.result?.state) === 'retained')) reasons.push('A terminal was explicitly retained or user-owned')
     if (shared.some(t => { const plan = this.store.get<{goalId?: string}>('task-plan', t.id); return plan?.goalId && !this.store.get<{archived?: boolean}>('goal', plan.goalId)?.archived })) reasons.push('Persistent workline retains this directory until explicitly archived')
-    if (directory && this.store.list<any>('knowledge').some(k => !k.archived && !k.supersededBy && JSON.stringify(k).includes(directory))) reasons.push('Engineering knowledge references this directory; inspect runtime dependencies')
     if (directory && this.store.tickets.list().some(other => other.id !== ticketId && !other.ended && (projects.directory(other.id) === directory
       || projects.workspaces(other.id).some(workspace => workspace.directory === directory)
       || (projects.context(other.id) as {dependencies: {directory?: string; workspaces: {directory: string}[]}[]}).dependencies.some(d => d.directory === directory || d.workspaces.some(workspace => workspace.directory === directory))))) reasons.push('Another ticket references this workspace or its evidence')
-    if (directory && this.store.list<any>('handoff').some(h => JSON.stringify(h).includes(directory))) reasons.push('Handoff evidence references this directory; preserve it outside the workspace first')
     if (directory && this.store.list<Cleanup>('workspace-cleanup').some(c => c.directory === directory && c.state !== 'reset')) reasons.push('Saved cleanup attempt requires reconciliation or an explicit reset')
     let head: string | undefined, branch: string | undefined, status: string | undefined, terminals: unknown
     if (directory && existsSync(directory)) {
@@ -53,8 +51,6 @@ export class WorkspaceCleanup {
         head = await git('rev-parse', 'HEAD'); branch = await git('symbolic-ref', '--short', 'HEAD')
         status = await git('status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching')
         if (status) reasons.push('Tracked, untracked or ignored files need preservation')
-        const baseline = this.store.get<{revision: string}>('workspace-baseline', owner)
-        if (!baseline || head !== baseline.revision) reasons.push('New commits or an unknown creation baseline need preservation')
         const shown = await this.native(['worktree', 'show', '--worktree', `id:${owned?.id}`], target.repository)
         if (shown.worktree?.id !== owned?.id || shown.worktree?.path !== directory) reasons.push('Orca workspace identity changed')
         const listing = await this.native(['terminal', 'list', '--worktree', `id:${owned?.id}`, '--limit', '1000'], target.repository)
@@ -63,12 +59,6 @@ export class WorkspaceCleanup {
       } catch (error) { reasons.push(String(error)) }
     } else reasons.push('Workspace directory is absent; reconcile its saved removal record')
     const referenceFingerprint = createHash('sha256').update(JSON.stringify({ticketId, directory, owned, target, head, branch, status, terminals, bindings})).digest('hex')
-    const referenceCheck = this.store.get<{fingerprint: string; evidence: string; evidenceHash: string; checkedAt: number}>('workspace-reference-check', ticketId)
-    let referencesVerified = false
-    if (referenceCheck && referenceCheck.fingerprint === referenceFingerprint && Date.now() >= referenceCheck.checkedAt && Date.now() - referenceCheck.checkedAt < 3_600_000) {
-      try { referencesVerified = createHash('sha256').update(readFileSync(referenceCheck.evidence)).digest('hex') === referenceCheck.evidenceHash } catch { /* Missing evidence is not proof of safety. */ }
-    }
-    if (!referencesVerified) reasons.push('External service/path references are unverified; record a fresh read-only assessment with cleanup references')
     if (unchanged() !== revision) reasons.push('Task or resource state changed during inspection; inspect again')
     const fingerprint = createHash('sha256').update(JSON.stringify({ ticketId, directory, owned, target, head, branch, status, terminals, bindings, reasons })).digest('hex')
     return { ticketId, directory, worktreeId: owned?.id, head, branch, eligible: reasons.length === 0, reasons, fingerprint, referenceFingerprint, observedAt: new Date().toISOString(), cleanup: this.store.get<Cleanup>('workspace-cleanup', ticketId) }
@@ -79,10 +69,10 @@ export class WorkspaceCleanup {
     const check = await this.inspect(ticketId)
     if (!evidence || check.referenceFingerprint !== fingerprint || !check.directory) throw new Error('Reference assessment requires the current inventory fingerprint and evidence file')
     const bytes = readFileSync(evidence), assessment = JSON.parse(bytes.toString('utf8'))
-    if (assessment.directory !== check.directory || assessment.references?.length !== 0 || !Array.isArray(assessment.references)
+    if (assessment.directory !== check.directory || !Array.isArray(assessment.references)
       || !Array.isArray(assessment.checks) || !assessment.checks.length || assessment.checks.some((c: unknown) => typeof c !== 'string' || !c.trim())
-      || !Number.isFinite(Date.parse(assessment.checkedAt)) || Date.parse(assessment.checkedAt) > Date.now() || Date.now() - Date.parse(assessment.checkedAt) > 3_600_000)
-      throw new Error('Evidence must name the exact directory, fresh checkedAt, performed checks and an empty references array')
+      || !Number.isFinite(Date.parse(assessment.checkedAt)) || Date.parse(assessment.checkedAt) > Date.now())
+      throw new Error('Evidence must name the exact directory, valid checkedAt, performed checks and a references array')
     authorize()
     const record = {ticketId, fingerprint, evidence: realpathSync(evidence), evidenceHash: createHash('sha256').update(bytes).digest('hex'), checkedAt: Date.parse(assessment.checkedAt)}
     this.store.put('workspace-reference-check', ticketId, record)

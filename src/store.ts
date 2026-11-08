@@ -76,10 +76,10 @@ export class Store implements Repositories {
         return fresh.length ? [{id:`held-inputs:${ticket.id}:${fresh.map(input=>input.id).join(',')}`,ticketId:ticket.id,kind:'inputs',text:'旧执行已隔离；收到新输入，请核对最新要求与现状，不能自动重放旧动作。',inputIds:fresh.map(input=>input.id)}] : []
       }
       const binding = assignment && this.get<{settled?: string; finished?: boolean}>('orca-assignment', assignment.id)
-      const pending = ticket.inputs.filter(input => input.kind === 'trigger' && input.human && !input.context && !this.get('input-resolution', input.id))
+      const pending = ticket.inputs.filter(input => input.kind === 'trigger' && input.human && !input.context && !input.readAt)
       return [
         ...(!ticket.ended && pending.length && (binding?.settled || binding?.finished) && Date.now() - Date.parse(pending[0].at) >= 120_000
-          ? [{ id: `inputs:${ticket.id}:${pending.map(i => i.id).join(',')}`, ticketId: ticket.id, kind: 'inputs', text: 'Execution ended with inputs still awaiting a processing report.', inputIds: pending.map(i => i.id) }] : []),
+          ? [{ id: `inputs:${ticket.id}:${pending.map(i => i.id).join(',')}`, ticketId: ticket.id, kind: 'inputs', text: 'Execution ended with unread inputs.', inputIds: pending.map(i => i.id) }] : []),
         ...(!ticket.ended && ticket.attention && !this.get('outbox', key('attention-reply', ticket.attention.id))
           ? [{ id: ticket.attention.id, ticketId: ticket.id, kind: 'attention', text: ticket.attention.question }] : []),
         ...(ticket.answers ?? []).map(triggerId => ({ id: `answer:${ticket.id}:${triggerId}`, ticketId: ticket.id, triggerId, kind: 'answer', text: this.get<{summary: string}>('answer', key('answer', ticket.id, triggerId))?.summary })),

@@ -366,7 +366,6 @@ test('first repository merge waits for the second authorized PR binding and clos
   const ticketId=f.accept(), primary={projectId:'p',componentId:'a',locationId:'a',repository:'/first',hostId:'local',kind:'git',github:{repository,owner}}
   const secondary={...primary,componentId:'b',locationId:'b',repository:'/second',github:{repository:'owner/second',owner}}
   f.store.put('ticket-target',ticketId,{...primary,ticketId,repositories:[primary,secondary]})
-  f.store.put('publish-authorization',ticketId,{repository,owner,repositories:[{repository,owner},{repository:'owner/second',owner}]})
   const first=pull(7), closedFirst={...first,state:'closed',merged_at:'2026-11-02T00:10:00Z',closed_at:'2026-11-02T00:10:00Z'}
   f.update({pulls:{7:first}}); f.routes({issues:[[]],pulls:[[first]]}); await f.tick()
   f.engine.report(ticketId,{state:'progress',summary:'First PR published; still implementing second repository'})
@@ -396,7 +395,6 @@ test('a resumed multi-repository round cannot count the previous round PRs as cu
   const ticketId=f.accept(), primary={projectId:'p',componentId:'a',locationId:'a',repository:'/first',hostId:'local',kind:'git',github:{repository,owner}}
   const secondary={...primary,componentId:'b',locationId:'b',repository:'/second',github:{repository:'owner/second',owner}}
   f.store.put('ticket-target',ticketId,{...primary,ticketId,repositories:[primary,secondary]})
-  f.store.put('publish-authorization',ticketId,{repository,owner,repositories:[{repository,owner},{repository:'owner/second',owner}]})
   f.engine.bindThread(ticketId,{source:'github',id:`${repository}:1`},true)
   f.engine.bindThread(ticketId,{source:'github',id:'owner/second:1'},true)
   f.engine.report(ticketId,{state:'ready',summary:'Original two repositories delivered'})
