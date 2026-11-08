@@ -886,3 +886,29 @@ test('ready uses DSH read and release semantics without requiring per-input form
   expect(f.store.threads.list().some(thread => thread.pending.includes('late-followup'))).toBe(true)
   expect(f.store.tickets.get(ticketId)?.ended?.outcome).toBe('completed')
 })
+
+
+test('answer acknowledgements suppress old notices, a new answer reopens them, and ended-ticket replies clear the answer', () => {
+  const f=setup()
+  f.call(['intake'],{id:'answer-work',text:'Investigate'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'answer-work',title:'Investigation'})
+  const assignment=f.store.tickets.get(ticketId)!.assignments[0].id
+  f.app.engine.assignmentStarted(ticketId,assignment);f.store.put('capability',assignment,{token:'test'})
+  const auth={ticket:ticketId,assignment,token:'test'}
+  f.call(['intake'],{id:'question',text:'What happened?'})
+  f.call(['route','attach'],{ticket:ticketId,trigger:'question'})
+  f.call(['report','progress'],{...auth,summary:'First answer',answers:'question'})
+  const notice=`answer:${ticketId}:question`
+  f.call(['router','ack'],{message:notice})
+  expect(f.store.routerNotices()).not.toEqual(expect.arrayContaining([expect.objectContaining({id:notice})]))
+  expect(f.store.tickets.get(ticketId)?.answers).toContain('question')
+  f.call(['report','progress'],{...auth,summary:'Updated answer',answers:'question'})
+  expect(f.store.routerNotices()).toEqual(expect.arrayContaining([expect.objectContaining({id:notice,text:'Updated answer'})]))
+  f.app.engine.stopTicket(ticketId,'Finished for today')
+  const disposition=f.store.triggers.disposition('question')!
+  f.store.triggers.saveDisposition('question',{...disposition,fanout:[]})
+  const reply=f.call(['reply'],{trigger:'question',text:'Updated answer'})
+  expect(f.store.tickets.get(ticketId)?.answers).not.toContain('question')
+  expect(f.store.get<any>('outbox',reply.id).ticketId).toBe(ticketId)
+  expect(f.store.routerNotices()).not.toEqual(expect.arrayContaining([expect.objectContaining({id:notice})]))
+})

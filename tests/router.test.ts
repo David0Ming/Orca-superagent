@@ -155,11 +155,14 @@ test('draining a batch does not generate more hints and newly added work coalesc
 })
 
 
-test('unchanged unhandled work is reminded after five minutes, timestamp-only observations do not flood', async () => {
+test('unchanged work never re-wakes on a timer; real new content still wakes', async () => {
   const f=fixture(); await f.bind()
   f.store.put('notice','pending',{id:'pending',text:'Needs action',observedAt:1}); await f.wake.tick()
   for(let i=0;i<19;i++) {f.advance(); f.store.put('notice','pending',{id:'pending',text:'Needs action',observedAt:i+2}); await f.wake.tick()}
   expect(f.state().sends).toBe(1)
-  f.advance(); await f.wake.tick(); expect(f.state().sends).toBe(2)
+  for(let i=0;i<100;i++) f.advance()
+  await f.wake.tick(); expect(f.state().sends).toBe(1)
+  f.store.put('notice','pending',{id:'pending',text:'New answer arrived'})
+  await f.wake.tick(); expect(f.state().sends).toBe(2)
   f.store.delete('notice','pending'); f.advance(); await f.wake.tick(); expect(f.state().sends).toBe(2)
 })

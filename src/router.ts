@@ -91,7 +91,7 @@ export class RouterWake {
     // Finish uncertain attention before considering newer work; never replace its request ID.
     const added = active?.keys ? keys.some(key => !active.keys!.includes(key)) : active?.fingerprint !== fingerprint
     const elapsed = Date.now() - (active?.createdAt ?? 0)
-    if (!wake || (wake.receipt && ((added && elapsed >= 15_000) || elapsed >= 5 * 60_000))) {
+    if (!wake || (wake.receipt && (added && elapsed >= 15_000))) {
       wake = { id: randomUUID(), bindingId: binding.id, requestId: randomUUID(), args: [
         'orchestration', 'send', '--from', binding.terminal, '--to', `orca_session_id:${binding.sessionId}`, '--type', 'status',
         '--subject', 'OSA pending Router work', '--body', `Pending OSA work is available. At your next safe checkpoint run ${this.options.osaCommand} router wait --timeout 0 with your current lease. After service updates, read the current skills/super-agent-router/SKILL.md before routing. Only if you have no lease, run router attach first. Preserve the single Router lease; if another owner holds it, leave work pending. Process the current work, then yield for native events. This attention is not a routing decision.`,

@@ -134,7 +134,10 @@ export class App {
           if (mail) store.put('outbox', reply.id, {...mail, triggerId: o.answers})
         }
         this.projects.recordHandoff(id, assignment, { ...o, reportState: action })
-        if (o.answers) store.put('answer', key('answer', id, o.answers), { summary })
+        if (o.answers) {
+          store.put('answer', key('answer', id, o.answers), { summary })
+          store.delete('router-notice-ack', `answer:${id}:${o.answers}`)
+        }
         if (action === 'ready' || action === 'dropped') engine.reply({ purpose: 'result', ticketId: id, text: summary })
         else if (action === 'blocked' || action === 'failed') store.put('notice', assignment + ':' + action, { id: assignment + ':' + action, ticketId: id, text: summary })
         return result
@@ -369,7 +372,10 @@ export class App {
       if (o.trigger) {
         const trigger = store.triggers.get(o.trigger)
         if (!trigger?.human || !this.isOwner(trigger.actor, trigger.meta) || !this.inScope(trigger.source, trigger.meta)) throw new Error('Only owner questions may be answered')
-        const reply = engine.reply({ purpose: 'answer', triggerId: trigger.id, text: required(o, 'text') }), mail = store.get<Mail>('outbox', reply.id)
+        const answering = store.tickets.list().filter(ticket => ticket.answers?.includes(trigger.id))
+        if (!o.ticket && answering.length > 1) throw new Error('Select --ticket for this answer')
+        const ticketId = o.ticket ?? answering[0]?.id
+        const reply = engine.reply({ purpose: 'answer', ...(ticketId ? {ticketId} : {}), triggerId: trigger.id, text: required(o, 'text') }), mail = store.get<Mail>('outbox', reply.id)
         if (mail) store.put('outbox', reply.id, {...mail, triggerId: trigger.id})
         return reply
       }

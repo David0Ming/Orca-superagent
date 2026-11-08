@@ -82,7 +82,7 @@ export class Store implements Repositories {
           ? [{ id: `inputs:${ticket.id}:${pending.map(i => i.id).join(',')}`, ticketId: ticket.id, kind: 'inputs', text: 'Execution ended with unread inputs.', inputIds: pending.map(i => i.id) }] : []),
         ...(!ticket.ended && ticket.attention && !this.get('outbox', key('attention-reply', ticket.attention.id))
           ? [{ id: ticket.attention.id, ticketId: ticket.id, kind: 'attention', text: ticket.attention.question }] : []),
-        ...(ticket.answers ?? []).map(triggerId => ({ id: `answer:${ticket.id}:${triggerId}`, ticketId: ticket.id, triggerId, kind: 'answer', text: this.get<{summary: string}>('answer', key('answer', ticket.id, triggerId))?.summary })),
+        ...(ticket.answers ?? []).filter(triggerId => !this.get('router-notice-ack', `answer:${ticket.id}:${triggerId}`)).map(triggerId => ({ id: `answer:${ticket.id}:${triggerId}`, ticketId: ticket.id, triggerId, kind: 'answer', text: this.get<{summary: string}>('answer', key('answer', ticket.id, triggerId))?.summary })),
     ] })]
   }
 
