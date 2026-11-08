@@ -6,6 +6,31 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { OrcaWorkerApi } from 'orca/worker'
 
+
+function panelStatus(status: any, stateDir: string): any {
+  const { attempts, historicalNotices, ...result } = status
+  if (Array.isArray(status.tickets)) result.tickets = status.tickets.map((ticket: any) => {
+    if (!ticket.execution) return ticket
+    const { assignment, ...execution } = ticket.execution
+    return { ...ticket, execution }
+  })
+  if (status.projects) result.projects = {
+    projects: status.projects.projects, components: status.projects.components, locations: status.projects.locations,
+    tasks: status.projects.tasks?.map((row: any) => ({ ticket: { id: row.ticket?.id }, context: {
+      target: row.context?.target, targets: row.context?.targets, workspaces: row.context?.workspaces, plan: row.context?.plan
+    }, blocked: row.blocked }))
+  }
+  if (Array.isArray(status.reportReceipts)) result.reportReceipts = status.reportReceipts.map((receipt: any) => ({
+    id: receipt.id, ticketId: receipt.ticketId, assignmentId: receipt.assignmentId,
+    result: { assignments: receipt.result?.assignments?.filter((assignment: any) => assignment.id === receipt.assignmentId).map((assignment: any) => ({ id: assignment.id, report: assignment.report })) || [] }
+  }))
+  if (Array.isArray(status.routingHistory)) result.routingHistory = status.routingHistory.map(({ mandate, ...decision }: any) => decision)
+  if (Array.isArray(status.candidates)) result.candidates = status.candidates.map((candidate: any) => ({
+    triggers: candidate.triggers?.map((trigger: any) => ({ id: trigger.id, text: trigger.text })) || []
+  }))
+  return JSON.parse(JSON.stringify({ ...result, stateDir }))
+}
+
 export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('osa.open-workbench', async () => {
     const stateDir = await orca.settings.get('stateDir')
@@ -45,7 +70,7 @@ export default function activate(orca: OrcaWorkerApi): void {
         if (!data.includes('\n')) return
         try {
           const response = JSON.parse(data.slice(0, data.indexOf('\n')))
-          finish(response.ok ? undefined : new Error(response.error), input.action === 'status' && response.ok ? { ...response.result, stateDir: resolvePath(stateDir) } : response.result)
+          finish(response.ok ? undefined : new Error(response.error), input.action === 'status' && response.ok ? panelStatus(response.result, resolvePath(stateDir)) : response.result)
         } catch (error) { finish(error as Error) }
       })
     })

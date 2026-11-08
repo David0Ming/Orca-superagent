@@ -178,6 +178,7 @@ export class App {
         }
       }
       return { tickets, projects: overview, publications,
+        executionHolds: store.list<{ticketId:string}>('execution-hold').filter(hold => ids.has(hold.ticketId)),
         configuration: {executor: store.get('config', 'executor'), runtime: store.get('config', 'runtime'), githubSources: this.githubSources, feishu: this.feishu, repository: store.get('config', 'repository')},
         inputResolutions: store.list<{ticketId: string}>('input-resolution').filter(input => ids.has(input.ticketId)),
         triggerDispositions: triggers.map(trigger => ({triggerId: trigger.id, ...store.triggers.disposition(trigger.id)})),
@@ -196,8 +197,9 @@ export class App {
             executionState: execution?.nativeState ?? 'unknown', handoff: store.get('handoff', ticket.id),
             pendingInputIds: ticket.inputs.filter(i => i.kind === 'trigger' && i.human && !i.context && !store.get('input-resolution', i.id)).map(i => i.id),
             queue: store.get('notice', `queue:${ticket.id}`) }
-        }), notices: store.list<{ ticketId?: string }>('notice').filter(item => !o.project || !item.ticketId || ids.has(item.ticketId)),
-        executionBindings: store.list<{ id: string; ticketId: string; finished?: boolean }>('orca-assignment').filter(item => ids.has(item.ticketId)).map(item => ({ ...item, holdsExecutorSlot: !item.finished })),
+        }), notices: store.list<{ ticketId?: string; archivedAt?: string }>('notice').filter(item => !item.archivedAt && (!o.project || !item.ticketId || ids.has(item.ticketId))),
+        historicalNotices: store.list<{archivedAt?:string}>('notice').filter(item => item.archivedAt),
+        executionBindings: store.list<{ id: string; ticketId: string; finished?: boolean }>('orca-assignment').filter(item => ids.has(item.ticketId)).map(item => ({ ...item, holdsExecutorSlot: !item.finished && this.store.get<{capacityReleased?:boolean}>('execution-hold',item.id)?.capacityReleased !== true })),
         executions: store.list<{ ticketId: string }>('execution').filter(item => ids.has(item.ticketId)), attempts: store.list<{ ticketId: string }>('execution-attempt').filter(item => ids.has(item.ticketId)) }
     }
     if (command === 'owner') {

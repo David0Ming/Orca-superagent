@@ -189,4 +189,16 @@ describe('Store', () => {
     store.put('input-resolution', 'followup', {summary:'Handled'})
     expect(store.routerNotices()).toEqual([])
   })
+
+  it('retains historical notices and held task inputs without presenting them as new Router work', () => {
+    const row = ticket('held', {assignments:[{id:'old',state:'running',createdAt:at}], inputs:[{id:'before',kind:'text',text:'old instruction',at}]})
+    store.tickets.save(row)
+    store.put('notice','historical',{id:'historical',text:'old notification',archivedAt:at})
+    store.put('execution-hold','old',{ticketId:row.id,assignmentId:'old',inputIds:['before']})
+    expect(store.routerNotices()).toEqual([])
+    expect(store.get('notice','historical')).toBeDefined()
+    row.inputs.push({id:'after',kind:'text',text:'new request',at});store.tickets.save(row)
+    expect(store.routerNotices()).toEqual([expect.objectContaining({ticketId:'held',kind:'inputs',inputIds:['after']})])
+    expect(store.tickets.get('held')?.ended).toBeUndefined()
+  })
 })

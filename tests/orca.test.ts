@@ -1194,3 +1194,47 @@ describe('mailbox report refusal', () => {
     expect(f.store.list('report-receipt')).toHaveLength(0)
   })
 })
+
+describe('cutover execution hold', () => {
+  it('preserves queued work and new comments across restart without any native effects', async () => {
+    const f = setup(); f.executor.start(f.ticket, f.assignment); await f.tick()
+    const ticket = f.store.tickets.get(f.ticket.id)!
+    ticket.inputs.push({ id: 'late-hold', kind: 'text', text: 'Keep this', at: new Date().toISOString() }); ticket.undelivered.push('late-hold'); f.store.tickets.save(ticket)
+    f.executor.deliver(ticket, ticket.assignments[0]!)
+    f.store.put('execution-hold', f.assignment.id, { assignmentId: f.assignment.id, ticketId: ticket.id, reason: 'cutover', at: new Date().toISOString(), capacityReleased: true })
+    const job = f.store.get('orca-job', 'deliver:assignment-1:late-hold'), binding = f.store.get('orca-assignment', f.assignment.id), before = f.calls().length
+    f.restart(); await f.tick(); await f.tick()
+    expect(f.calls()).toHaveLength(before)
+    expect(f.store.get('orca-job', 'deliver:assignment-1:late-hold')).toEqual(job)
+    expect(f.store.get('orca-assignment', f.assignment.id)).toEqual(binding)
+    expect(f.store.tickets.get(ticket.id)!.undelivered).toContain('late-hold')
+    expect(f.store.tickets.get(ticket.id)!.ended).toBeUndefined()
+  })
+
+  it('releases capacity only for an explicitly proven exited held assignment', async () => {
+    const f = setup(false, undefined, 1)
+    f.executor.start(f.ticket, f.assignment); await f.tick()
+    const other = { ...f.ticket, id: 'other-hold', title: 'Other', execution: { name: 'other-hold', directory: '', assignment: 'Other' }, assignments: [{ id: 'other-assignment', state: 'pending' as const, createdAt: f.ticket.createdAt }] }
+    f.store.tickets.save(other)
+    f.store.put('execution-hold', f.assignment.id, { assignmentId: f.assignment.id, ticketId: f.ticket.id, reason: 'unknown', at: new Date().toISOString() })
+    f.executor.start(other, other.assignments[0]); await f.tick()
+    expect(f.state().created).toBe(1)
+    f.store.put('execution-hold', f.assignment.id, { assignmentId: f.assignment.id, ticketId: f.ticket.id, reason: 'exited', at: new Date().toISOString(), capacityReleased: true })
+    await f.tick()
+    expect(f.state().created).toBe(2)
+  })
+
+  it('keeps the hold until explicit retry verifies native state and children', async () => {
+    const f = setup(); f.executor.start(f.ticket, f.assignment); await f.tick()
+    f.store.put('execution-hold', f.assignment.id, { assignmentId: f.assignment.id, ticketId: f.ticket.id, reason: 'cutover', at: new Date().toISOString(), capacityReleased: true })
+    await expect(f.executor.retryTicket(f.engine, f.ticket.id)).rejects.toThrow('positively failed or stopped')
+    expect(f.store.get('execution-hold', f.assignment.id)).toBeDefined()
+    f.update({ workerState: 'stopped', dispatchStatus: 'failed', childRuns: [{ id: 'child-run', coordinator_handle: 'worker-1' }], workers: [...f.state().workers, { dispatchId: 'child', runId: 'child-run', terminalState: 'active' }] })
+    await expect(f.executor.retryTicket(f.engine, f.ticket.id)).rejects.toThrow('Child worker resources')
+    expect(f.store.get('execution-hold', f.assignment.id)).toBeDefined()
+    f.update({ workers: f.state().workers.filter((worker: any) => worker.dispatchId !== 'child') })
+    await f.executor.retryTicket(f.engine, f.ticket.id)
+    expect(f.store.get('execution-hold', f.assignment.id)).toBeUndefined()
+    expect(f.state().created).toBe(2)
+  })
+})

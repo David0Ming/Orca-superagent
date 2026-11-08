@@ -46,6 +46,7 @@ export class OrcaExecutor implements Executor {
     if (!ticket || ticket.ended || !binding?.dispatchId || !binding.taskId || !ticket.execution?.directory) throw new Error('No recoverable Executor assignment')
     const completed = this.store.get<Recovery>('orca-recovery', `retry:${binding.id}:${binding.dispatchId}`)
     if (completed?.done) {
+      if (this.store.get('execution-hold', binding.id)) throw new Error('Held assignment has a completed recovery receipt; inspect before retrying')
       const response = this.store.get<Operation>('orca-operation', completed.id)?.response
       const receipt = response?.ok === true && response.result
       if (!receipt || receipt.state !== 'ready' || !receipt.dispatchId || receipt.dispatchId === binding.dispatchId || receipt.taskId !== binding.taskId || receipt.runId !== binding.runId || !receipt.effects?.some((item: Json) => item.kind === 'terminal' && item.role === 'agent' && item.id))
@@ -91,6 +92,7 @@ export class OrcaExecutor implements Executor {
       if (this.store.get<Binding>('orca-assignment', binding.id)?.dispatchId !== binding.dispatchId) throw new Error('Executor changed during recovery inspection')
       if (!this.canStart(current, binding.id)) throw new Error('Executor capacity, target or resource is blocked; retry later')
       this.store.put('orca-recovery', recovery.id, recovery)
+      this.store.delete('execution-hold', binding.id)
       binding.finished = false
       this.save(binding)
       engine.note(ticketId, `Recovery after confirmed ${shown.worker.state} of ${binding.dispatchId}. Inspect the existing worktree, git history and external state; preserve completed work and do not repeat external effects. Previous report: ${current.assignments.at(-1)?.report?.summary ?? 'none'}. Read all unread inputs before continuing.`)
@@ -216,7 +218,7 @@ export class OrcaExecutor implements Executor {
       ...starts.map(job => job.assignmentId),
       ...this.store.list<Binding>('orca-assignment').filter(b => b.dispatchId && (!b.finished || (b.released && !this.store.get<{done?: boolean}>('orca-operation', `close:${b.id}`)?.done))).map(b => b.id),
     ])
-    for (const id of ids) if (!this.working.has(id)) {
+    for (const id of ids) if (!this.working.has(id) && !this.store.get('execution-hold', id)) {
       const work = this.runAssignment(engine, id).catch(error => this.notice(`assignment:${id}`, this.store.get<Binding>('orca-assignment', id)?.ticketId ?? '', String(error)))
         .finally(() => { this.working.delete(id) })
       this.working.set(id, work)
@@ -265,7 +267,7 @@ export class OrcaExecutor implements Executor {
 
   private canStart(ticket: Ticket, assignmentId: string): boolean {
     const projects = new Projects(this.store), blocked = projects.blocked(ticket.id)
-    const active = this.store.list<Binding>('orca-assignment').filter(item => item.id !== assignmentId && !item.finished)
+    const active = this.store.list<Binding>('orca-assignment').filter(item => item.id !== assignmentId && !item.finished && !this.store.get<{capacityReleased?: boolean}>('execution-hold', item.id)?.capacityReleased)
     const resources = this.store.get<TaskPlan>('task-plan', ticket.id)?.resources ?? []
     const directories = (id: string) => {
       const targets = projects.targets(id)
@@ -303,6 +305,7 @@ export class OrcaExecutor implements Executor {
   }
 
   private async runAssignment(engine: Engine, assignmentId: string): Promise<void> {
+    if (this.store.get('execution-hold', assignmentId)) return
     for (const recovery of this.store.list<Recovery>('orca-recovery').filter(item => !item.done && item.assignmentId === assignmentId)) {
       try { await this.recover(recovery, engine) }
       catch (error) { this.notice(recovery.id, recovery.ticketId, String(error)) }

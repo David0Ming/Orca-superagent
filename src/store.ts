@@ -68,8 +68,13 @@ export class Store implements Repositories {
   }
 
   routerNotices(): unknown[] {
-    return [...this.list('notice'), ...this.tickets.list().flatMap(ticket => {
+    return [...this.list<{archivedAt?:string}>('notice').filter(item => !item.archivedAt), ...this.tickets.list().flatMap(ticket => {
       const assignment = latestAssignment(ticket)
+      const held = assignment && this.get<{inputIds?:string[]}>('execution-hold', assignment.id)
+      if (held) {
+        const fresh = ticket.inputs.filter(input => !(held.inputIds ?? []).includes(input.id))
+        return fresh.length ? [{id:`held-inputs:${ticket.id}:${fresh.map(input=>input.id).join(',')}`,ticketId:ticket.id,kind:'inputs',text:'旧执行已隔离；收到新输入，请核对最新要求与现状，不能自动重放旧动作。',inputIds:fresh.map(input=>input.id)}] : []
+      }
       const binding = assignment && this.get<{settled?: string; finished?: boolean}>('orca-assignment', assignment.id)
       const pending = ticket.inputs.filter(input => input.kind === 'trigger' && input.human && !input.context && !this.get('input-resolution', input.id))
       return [

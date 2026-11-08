@@ -126,6 +126,8 @@ function renderDetail() {
   back.type = 'button'; back.setAttribute('aria-label', '返回任务列表'); back.onclick = () => $('layout').classList.remove('show-detail')
   head.append(back, node('h1', topic.title || '未命名请求'), node('div', `${topic.projectName || '未关联项目'} · ${stateText(topic)}`, 'muted'))
   const body = node('div', null, 'detail-body'); body.append(node('div', (topic.historyLimitations || ['以下为已记录的交流，不代表完整原生会话。']).join(' '), 'history-note'))
+  const hold = (status.executionHolds || []).find(item => item.ticketId === topic.ticketId && item.assignmentId === topic.ticket?.assignments?.at(-1)?.id)
+  if (hold) body.append(node('div', '旧执行已隔离，历史和任务状态保留。补充会保存并交 Router 核对；不会直接重放旧动作。', 'history-note'))
   for (const entry of topic.conversation || []) {
     const item = node('article', null, 'message'), h = node('div', null, 'message-head')
     const actor = entry.kind === 'trigger' ? (['panel', 'router'].includes(entry.trigger?.source) && entry.trigger?.human ? '你' : entry.trigger?.actor?.id || entry.trigger?.source || '来源消息') : entry.kind === 'report' ? '执行者' : ['decision', 'routingAttachment'].includes(entry.kind) ? 'Router' : 'OSA'
