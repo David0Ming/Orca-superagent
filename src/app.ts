@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { userInfo } from 'node:os'
-import { Engine, key, latestAssignment, followupOwners, UserError, type ActorRef, type Candidate, type Executor, type OutboundMessage, type Policy, type ReplyStatus, type Ticket, type Trigger } from '../vendor/dsh-core/src/index.ts'
+import { Engine, key, latestAssignment, type ActorRef, type Candidate, type Executor, type OutboundMessage, type Policy, type ReplyStatus, type Ticket, type Trigger } from '../vendor/dsh-core/src/index.ts'
 import type { Store } from './store.ts'
 import type { FeishuConfig } from './feishu.ts'
 import { Projects, type TicketTarget } from './projects.ts'
 
 export interface Request { command: string[]; options: Record<string, string>; id: string }
-type Mail = OutboundMessage & { status: ReplyStatus }
+type Mail = OutboundMessage & { status: ReplyStatus; triggerId?: string }
 type Lease = { token: string; expires: number }
 export type GitHubConfig = { repository: string; owner: { id: string; login: string } }
 const required = (options: Record<string, string>, key: string) => {
@@ -51,15 +51,9 @@ export class App {
   }
 
   private inScope(source: string, meta: Record<string, unknown>): boolean {
-    return source === 'router' || (source === 'panel' && typeof meta.projectId === 'string' && !!this.store.get('project', meta.projectId)) || (source === 'github' && this.githubSources.some(source => meta.repository === source.repository))
+    const topic = source === 'panel' && typeof meta.topicTriggerId === 'string' ? this.store.triggers.get(meta.topicTriggerId) : undefined
+    return source === 'router' || (source === 'panel' && ((typeof meta.projectId === 'string' && !!this.store.get('project', meta.projectId)) || (meta.projectId === undefined && topic?.source === 'router' && topic.human && this.isOwner(topic.actor)))) || (source === 'github' && this.githubSources.some(source => meta.repository === source.repository))
       || (source === 'feishu' && !!this.feishu && meta.chatId === this.feishu.chatId)
-  }
-
-  private assertPanelTarget(ticketId: string, meta: Record<string, unknown>): void {
-    const target = this.store.get<TicketTarget>('ticket-target', ticketId)
-    if (!target || target.projectId !== meta.projectId) throw new Error('Panel input belongs to another project or the task has no bound project')
-    const locations = new Set(this.projects.targets(ticketId).map(target => target.locationId))
-    if (Array.isArray(meta.locationIds) && meta.locationIds.some(id => !locations.has(id))) throw new Error('Panel input selects a repository outside this task; hand back for new work')
   }
 
   executorTicket(o: Record<string, string>): Ticket {
@@ -134,7 +128,10 @@ export class App {
         for (const inputId of processed) store.put('input-resolution', inputId, { inputId, ticketId: id, assignmentId: assignment, state: action, summary })
         const result = engine.report(id, { state: action as 'ready', summary, ...(o.question !== undefined ? { question: o.question.trim() || null } : {}), ...(o['asked-by'] ? { askedBy: o['asked-by'] } : {}), ...(o.answers ? { answers: o.answers } : {}) })
         if (result.attention && ticket.channels.some(channel => channel.source === 'panel')) engine.reply({purpose: 'attention', ticketId: id, question: result.attention.question, text: result.attention.question})
-        if (o.answers && store.triggers.get(o.answers)?.source === 'panel') engine.reply({purpose: 'answer', ticketId: id, triggerId: o.answers, text: summary})
+        if (o.answers && store.triggers.get(o.answers)?.source === 'panel') {
+          const reply = engine.reply({purpose: 'answer', ticketId: id, triggerId: o.answers, text: summary}), mail = store.get<Mail>('outbox', reply.id)
+          if (mail) store.put('outbox', reply.id, {...mail, triggerId: o.answers})
+        }
         this.projects.recordHandoff(id, assignment, { ...o, reportState: action })
         if (o.answers) store.put('answer', key('answer', id, o.answers), { summary })
         if (action === 'ready' || action === 'dropped') engine.reply({ purpose: 'result', ticketId: id, text: summary })
@@ -187,6 +184,7 @@ export class App {
         candidates: store.list<Candidate>('candidate').filter(candidate => candidate.triggers.some(trigger => triggerIds.has(trigger.id))), triggers,
         outbox: store.list<Mail>('outbox').filter(mail => !o.project || ids.has(mail.ticketId ?? '') || projectIds.has(mail.channel.address.projectId)),
         routingHistory: store.list<{ticketId?: string; triggerIds: string[]}>('core.decision').filter(decision => !o.project || ids.has(decision.ticketId ?? '') || decision.triggerIds.some(id => triggerIds.has(id))),
+        routingAttachments: store.list<{ticketId:string}>('routing-attachment').filter(item=>ids.has(item.ticketId)),
         ownerActions: store.list<{ticketId?: string}>('owner-action').filter(action => !o.project || ids.has(action.ticketId ?? '')),
         rejectedSubmissions: store.list<{project?: string; ticket?: string}>('owner-rejection').filter(item => !o.project || projectIds.has(item.project ?? '') || ids.has(item.ticket ?? '')),
         routerHealth: { binding: store.get('router', 'terminal'), health: store.get('router', 'health'), attention: store.get('router', 'attention'), leaseExpires: store.get<Lease>('router', 'lease')?.expires },
@@ -206,12 +204,10 @@ export class App {
       if (action === 'reevaluate') {
         const triggerId = required(o, 'trigger'), trigger = store.triggers.get(triggerId)
         if (!trigger?.human || !this.isOwner(trigger.actor, trigger.meta) || !this.inScope(trigger.source, trigger.meta)) throw new Error('Only in-scope owner requests may be reevaluated')
-        if (trigger.source === 'panel') {
+        if (trigger.source === 'panel' && typeof trigger.meta.projectId === 'string') {
           const project = this.projects.handle(['project', 'show'], {id: String(trigger.meta.projectId)}) as {id: string; archived?: boolean; paused?: boolean}
           if (project.archived || project.paused || (o.project && (this.projects.handle(['project', 'show'], {id: o.project}) as {id: string}).id !== project.id)) throw new Error('Request project is unavailable or does not match')
         }
-        const owners = followupOwners(trigger, store)
-        if (owners.length) throw new UserError('workerDecides', {tickets: owners.join(', ')})
         const requeued = engine.reevaluate(triggerId)
         engine.evaluateDue()
         return {triggerId, requeued}
@@ -224,21 +220,35 @@ export class App {
       }
       if (action === 'request' || action === 'comment') {
         const id = `panel:${required(o, 'id')}`, text = required(o, 'text')
-        const ticket = action === 'comment' ? store.tickets.get(required(o, 'ticket')) : undefined
-        if (action === 'comment' && (!ticket || ticket.ended?.by === 'human')) throw new Error('Comments require an existing task that has not been stopped')
-        const target = ticket && store.get<TicketTarget>('ticket-target', ticket.id)
-        const project = this.projects.handle(['project', 'show'], { id: target?.projectId ?? required(o, 'project') }) as {id: string; archived?: boolean; paused?: boolean}
-        if (project.archived || project.paused) throw new Error('Project is paused or archived')
-        if (o.project && project.id !== (this.projects.handle(['project', 'show'], {id: o.project}) as {id: string}).id) throw new Error('Comment project does not match task')
-        const locationIds = o.locations?.split(',').map(id => id.trim()).filter(Boolean)
-        if (locationIds?.length) this.projects.resolve({project: project.id, locations: locationIds.join(',')})
-        const thread = ticket ? `task:${ticket.id}` : `request:${id}`
-        const meta = { projectId: project.id, ...(ticket ? {ticketId: ticket.id} : {}), ...(locationIds ? {locationIds} : {}) }
-        if (ticket) this.assertPanelTarget(ticket.id, meta)
-        const channel = { source: 'panel', thread, address: { projectId: project.id, ...(ticket ? {ticketId: ticket.id} : {}) } }
+        if (action === 'comment' && (!!o.ticket === !!o.trigger)) throw new Error('Comments require exactly one --ticket or --trigger')
         const existing = store.triggers.get(id)
+        const topic = action === 'comment' && o.trigger ? store.triggers.get(o.trigger) : undefined
+        if (action === 'comment' && o.trigger && (!topic || !['panel', 'router'].includes(topic.source) || topic.meta.topicTriggerId || topic.meta.ticketId || !topic.human || !this.isOwner(topic.actor, topic.meta) || !this.inScope(topic.source, topic.meta))) throw new Error('Comments require an original in-scope owner panel or Router request')
+        const topicIds = topic && new Set([topic.id, ...store.list<Trigger>('core.trigger').filter(input => input.meta.topicTriggerId === topic.id).map(input => input.id)])
+        const matches = topicIds ? store.tickets.list().filter(ticket => ticket.origin.triggerIds.some(id => topicIds.has(id)) || ticket.inputs.some(input => input.kind === 'trigger' && topicIds.has(input.triggerId))) : []
+        if (matches.length > 1) throw new Error('Request belongs to multiple tasks; select the task explicitly')
+        if (existing && topic && existing.meta.topicTriggerId === topic.id) {
+          const locations = o.locations?.split(',').map(id => id.trim()).filter(Boolean)
+          if (existing.text !== text || (o.project && (this.projects.handle(['project', 'show'], {id:o.project}) as {id:string}).id !== existing.meta.projectId) || (locations && JSON.stringify(locations) !== JSON.stringify(existing.meta.locationIds))) throw new Error('Input id already used with different content')
+          return {id, result: engine.receive(existing)}
+        }
+        const ticket = action === 'comment' ? o.ticket ? store.tickets.get(o.ticket) : matches[0] : undefined
+        if (action === 'comment' && ((o.ticket && !ticket) || ticket?.ended?.by === 'human')) throw new Error('Comments require an existing task that has not been stopped')
+        const target = ticket && store.get<TicketTarget>('ticket-target', ticket.id)
+        const projectId = target?.projectId ?? (typeof topic?.meta.projectId === 'string' ? topic.meta.projectId : action === 'request' ? required(o, 'project') : o.project)
+        const project = projectId ? this.projects.handle(['project', 'show'], {id:projectId}) as {id: string; archived?: boolean; paused?: boolean} : undefined
+        if (project?.archived || project?.paused) throw new Error('Project is paused or archived')
+        if (o.project && project?.id !== (this.projects.handle(['project', 'show'], {id: o.project}) as {id: string}).id) throw new Error('Comment project does not match task or original request')
+        const selected = o.locations?.split(',').map(id => id.trim()).filter(Boolean)
+        const inherited = !ticket && Array.isArray(topic?.meta.locationIds) ? topic.meta.locationIds as string[] : undefined
+        const locationIds = selected ?? inherited
+        if (locationIds?.length) this.projects.resolve({...(project ? {project: project.id} : {}), locations: locationIds.join(',')})
+        const thread = topic?.threads[0]?.id ?? (ticket ? `task:${ticket.id}` : `request:${id}`)
+        const meta = { ...(project ? {projectId: project.id} : {}), ...(topic ? {topicTriggerId: topic.id, ...(typeof topic.meta.projectId === 'string' ? {entryProjectId: topic.meta.projectId} : {})} : ticket ? {ticketId: ticket.id} : {}), ...(locationIds ? {locationIds} : {}) }
+        const origin = ticket && store.triggers.get(ticket.origin.triggerId)
+        const channel = topic?.channel ?? (origin && ['panel', 'router'].includes(origin.source) ? origin.channel : undefined) ?? { source: 'panel', thread, address: { ...(project ? {projectId: project.id} : {}), ...(!topic && ticket ? {ticketId: ticket.id} : {}) } }
         if (existing && (existing.text !== text || JSON.stringify(existing.meta) !== JSON.stringify(meta) || JSON.stringify(existing.channel) !== JSON.stringify(channel))) throw new Error('Input id already used with different content')
-        const result = engine.receive({ id, source: 'panel', actor: {source: 'panel', id: this.owner}, human: true, addressed: 'direct', at: existing?.at ?? new Date().toISOString(), text, threads: [{source: 'panel', id: thread}], channel, meta })
+        const result = engine.receive({ id, source: 'panel', actor: {source: 'panel', id: this.owner}, human: true, addressed: 'direct', at: existing?.at ?? new Date().toISOString(), text, threads: [topic?.threads[0] ?? {source: 'panel', id: thread}], channel, meta })
         if (ticket && !existing && !store.triggers.disposition(id)?.fanout.includes(ticket.id)) engine.attach(ticket.id, id)
         engine.evaluateDue()
         store.delete('owner-rejection', o.id)
@@ -259,7 +269,11 @@ export class App {
       engine.evaluateDue()
       const candidates = store.list<Candidate>('candidate')
       for (const candidate of candidates) engine.candidateDelivered(candidate.evalId)
-      return { candidates, messages: store.list<Mail>('outbox').filter(item => item.status === 'pending' && item.channel.source === 'router'), notices: store.routerNotices() }
+      const threads = new Set(candidates.map(candidate => candidate.thread.key))
+      const topicInputs = store.list<Trigger>('core.trigger').filter(trigger => trigger.threads.some(thread => threads.has(`${thread.source}:${thread.id}`)))
+      const topicTriggerIds = new Set(topicInputs.map(trigger => trigger.id))
+      const topicReplies = store.list<Mail>('outbox').filter(message => message.triggerId ? topicTriggerIds.has(message.triggerId) : message.channel.source !== 'router' && threads.has(`${message.channel.source}:${message.channel.thread}`))
+      return { candidates, topicInputs, topicReplies, messages: store.list<Mail>('outbox').filter(item => item.status === 'pending' && item.channel.source === 'router'), notices: store.routerNotices() }
     }
     if (command === 'router' && action === 'ack') {
       const id = required(o, 'message'), mail = store.get<Mail>('outbox', id)
@@ -289,12 +303,14 @@ export class App {
         if (!ticket) throw new Error('Unknown ticket')
         if (o.project || o.component || o.location || o.locations) this.projects.bind(ticket, o)
         const target = store.get<TicketTarget>('ticket-target', ticketId)
-        if (trigger.source === 'panel') this.assertPanelTarget(ticketId, trigger.meta)
+        const crossProject = trigger.source === 'panel' && typeof trigger.meta.projectId === 'string' && target && target.projectId !== trigger.meta.projectId
+        if (crossProject) required(o, 'reason')
         if (trigger.source === 'github' && target && !this.projects.targets(ticketId).some(target => target.github?.repository === trigger.meta.repository)) throw new Error('GitHub input belongs to another component')
-        const origins = store.tickets.list().filter(ticket => ticket.origin.triggerIds.includes(trigger.id) || ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id))
-        if (origins.some(ticket => ticket.id !== ticketId)) throw new Error('Input already belongs to another ticket')
-        if (origins.length && !store.triggers.disposition(trigger.id)?.requeued) return ticket
-        return engine.attach(ticketId, trigger.id)
+        const belongs = ticket.origin.triggerIds.includes(trigger.id) || ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id)
+        if (belongs && !store.triggers.disposition(trigger.id)?.requeued) return ticket
+        const attached = engine.attach(ticketId, trigger.id)
+        if (o.reason) store.put('routing-attachment', key('attachment', ticketId, trigger.id), {ticketId, triggerId: trigger.id, reason:o.reason, at:new Date().toISOString()})
+        return attached
       }
       if (action === 'stop') return engine.stopTicket(required(o, 'ticket'), o.reason)
       if (action === 'retry') {
@@ -302,15 +318,23 @@ export class App {
         if (!ticket || ticket.ended) throw new Error('Retry requires an open ticket')
         return { ticketId: ticket.id }
       }
-      const trigger = required(o, 'trigger')
+      let trigger = required(o, 'trigger')
       if (action === 'accept') {
         if (o.name && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(o.name)) throw new Error('Name must contain lowercase letters, digits and hyphens')
+        const requestedTriggerId = trigger, requested = store.triggers.get(trigger)
+        const original = typeof requested?.meta.topicTriggerId === 'string' ? store.triggers.get(requested.meta.topicTriggerId) : undefined
+        if (original?.human && this.isOwner(original.actor, original.meta) && original.threads.some(thread => requested?.threads.some(ref => ref.source === thread.source && ref.id === thread.id))) {
+          const disposition = store.triggers.disposition(original.id), decision = disposition?.decisionId && store.decisions.get(disposition.decisionId)
+          const thread = store.threads.get(`${original.threads[0].source}:${original.threads[0].id}`)
+          const requestedDisposition = store.triggers.disposition(requestedTriggerId)
+          const replay = decision && decision.kind === 'accept' && decision.audit?.requestedTriggerId === requestedTriggerId && !requestedDisposition?.requeued && !requestedDisposition?.handbacks?.length
+          if (replay || ((!decision || decision.kind === 'unavailable') && !disposition?.fanout.length && (engine.candidate(original.id) || thread?.pending.includes(original.id)))) trigger = original.id
+        }
         // A replay keeps its original target even after registry defaults change.
         const existing = store.tickets.list().find(ticket => ticket.origin.triggerIds.includes(trigger))
         const source = store.triggers.get(trigger)
-        const routing = { ...o, ...(source?.source === 'panel' ? { project: String(source.meta.projectId), ...(Array.isArray(source.meta.locationIds) ? {locations: source.meta.locationIds.join(',')} : {}) } : {}) }
-        if (source?.source === 'panel' && Array.isArray(source.meta.locationIds) && (o.locations || o.location) && JSON.stringify([...(o.locations ?? o.location).split(',')].sort()) !== JSON.stringify([...source.meta.locationIds].sort())) throw new Error('Route locations do not match owner request')
-        if (source?.source === 'panel' && o.project && (this.projects.handle(['project', 'show'], {id: o.project}) as {id: string}).id !== source.meta.projectId) throw new Error('Route project does not match owner request')
+        const routing = { ...o, ...(source?.source === 'panel' && typeof source.meta.projectId === 'string' && !o.project ? { project: String(source.meta.projectId) } : {}), ...(source?.source === 'panel' && !o.locations && !o.location && (!o.project || o.project === source.meta.projectId) && Array.isArray(source.meta.locationIds) ? {locations:source.meta.locationIds.join(',')} : {}) }
+        if (source?.source === 'panel' && typeof source.meta.projectId === 'string' && o.project && (this.projects.handle(['project', 'show'], {id:o.project}) as {id:string}).id !== source.meta.projectId) required(o, 'reason')
         if (existing && (o.project || o.component || o.location || o.locations)) this.projects.bind(existing, o)
         const target = existing ? store.get<TicketTarget>('ticket-target', existing.id)
           : store.list('project').length ? this.projects.resolve(routing, source?.source === 'github' ? String(source.meta.repository) : undefined) : undefined
@@ -324,8 +348,16 @@ export class App {
         this.routing = routing
         try {
           if (!source?.text?.trim()) throw new Error('Owner request text is missing')
-          const decision = engine.decide(trigger, { kind: 'accept', title: required(o, 'title'), scope: source.text, reason: o.reason ?? 'Owner request', ...(o.name ? { name: o.name } : {}) })
+          const decision = engine.decide(trigger, { kind: 'accept', title: required(o, 'title'), scope: source.text, reason: o.reason ?? 'Owner request', ...(requestedTriggerId !== trigger ? {audit:{requestedTriggerId,topicTriggerId:trigger}} : {}), ...(o.name ? { name: o.name } : {}) })
           if (o.publish && decision.ticketId) store.put('publish-authorization', decision.ticketId, { ...publishing, ...(publishingTargets.length > 1 ? {repositories: publishingTargets} : {}) })
+          if (decision.ticketId && !existing && ['panel', 'router'].includes(source.source) && !source.meta.topicTriggerId) {
+            const pending = new Set(store.threads.get(`${source.threads[0].source}:${source.threads[0].id}`)?.pending ?? [])
+            const related = store.list<Trigger>('core.trigger').filter(input => input.meta.topicTriggerId === source.id && pending.has(input.id) && !store.triggers.disposition(input.id)?.fanout.length)
+            for (const input of related) {
+              const ticket = store.tickets.get(decision.ticketId)!
+              if (!ticket.origin.triggerIds.includes(input.id) && !ticket.inputs.some(item => item.kind === 'trigger' && item.triggerId === input.id)) engine.attach(decision.ticketId, input.id)
+            }
+          }
           return decision
         } finally { this.routing = undefined }
       }
@@ -335,7 +367,9 @@ export class App {
       if (o.trigger) {
         const trigger = store.triggers.get(o.trigger)
         if (!trigger?.human || !this.isOwner(trigger.actor, trigger.meta) || !this.inScope(trigger.source, trigger.meta)) throw new Error('Only owner questions may be answered')
-        return engine.reply({ purpose: 'answer', triggerId: trigger.id, text: required(o, 'text') })
+        const reply = engine.reply({ purpose: 'answer', triggerId: trigger.id, text: required(o, 'text') }), mail = store.get<Mail>('outbox', reply.id)
+        if (mail) store.put('outbox', reply.id, {...mail, triggerId: trigger.id})
+        return reply
       }
       if (o.purpose && !['result', 'attention'].includes(o.purpose)) throw new Error('Invalid reply purpose')
       return engine.reply({ purpose: o.purpose === 'attention' ? 'attention' : 'result', ticketId: required(o, 'ticket'), ...(o.purpose === 'attention' ? { question: required(o, 'question') } : {}), text: required(o, 'text') })

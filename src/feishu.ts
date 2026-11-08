@@ -128,8 +128,13 @@ export class Feishu {
   }
 
   private ingest(engine: Engine, message: Json, started: number, rootHint?: string): void {
-    if (message.deleted || message.sender?.sender_type !== 'user' || message.sender.id !== this.options.ownerId) return
-    if (message.sender.id_type !== 'open_id' || typeof message.create_time !== 'string' || !/^\d+$/.test(message.create_time)) throw new Error('Invalid Feishu owner or timestamp')
+    if (message.deleted || !['user', 'app'].includes(message.sender?.sender_type)) return
+    const human = message.sender.sender_type === 'user', actorId = message.sender.id
+    const root = id(message.root_id || rootHint || message.message_id, 'om')
+    if (rootHint && root !== rootHint) throw new Error('Feishu root mismatch')
+    const thread = `${this.options.chatId}:${root}`
+    if (actorId !== this.options.ownerId && !this.store.threads.get(`feishu:${thread}`)?.subscriptions.length) return
+    if (typeof actorId !== 'string' || !actorId.trim() || (human && message.sender.id_type !== 'open_id') || typeof message.create_time !== 'string' || !/^\d+$/.test(message.create_time)) throw new Error('Invalid Feishu sender or timestamp')
     const at = Number(message.create_time)
     if (!Number.isSafeInteger(at) || !Number.isFinite(new Date(at).getTime())) throw new Error('Invalid Feishu message time')
     if (at < started) return
@@ -140,14 +145,15 @@ export class Feishu {
     const body = JSON.parse(message.body?.content ?? '')
     const text = message.msg_type === 'text' ? body.text : JSON.stringify(body)
     if (typeof text !== 'string' || !text.trim()) throw new Error('Empty Feishu text')
-    const root = id(message.root_id || rootHint || message.message_id, 'om')
-    if (rootHint && root !== rootHint) throw new Error('Feishu root mismatch')
-    const thread = `${this.options.chatId}:${root}`
+    if (!human && [this.options.botId, this.options.appId].includes(actorId) && [...text.matchAll(/\[osa:([^\s\[\]]+)\]/g)].some(match => {
+      const mail = this.store.get<Mail>('outbox', match[1])
+      return mail?.channel.source === 'feishu' && mail.channel.thread === thread && text === `${mail.text}\n\n[osa:${mail.id}]`
+    })) return
     this.store.atomic(() => {
-      engine.receive({ id: key('feishu', message.message_id, text), source: 'feishu', actor: { source: 'feishu', id: this.options.ownerId },
-        human: true, addressed: 'direct', text, at: new Date(at).toISOString(), threads: [{ source: 'feishu', id: thread }],
+      engine.receive({ id: key('feishu', message.message_id, text), source: 'feishu', actor: { source: 'feishu', id: actorId },
+        human, addressed: 'direct', text, at: new Date(at).toISOString(), threads: [{ source: 'feishu', id: thread }],
         channel: { source: 'feishu', thread, address: { chatId: this.options.chatId, messageId: root } },
-        meta: { chatId: this.options.chatId, messageId: message.message_id, rootId: root } })
+        meta: { chatId: this.options.chatId, messageId: message.message_id, rootId: root, senderType: message.sender.sender_type } })
       if (!this.store.get('feishu.topic', thread)) this.store.put('feishu.topic', thread, { root, chatId: this.options.chatId })
     })
   }

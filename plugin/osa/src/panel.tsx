@@ -1,7 +1,7 @@
 import { atom, read, set, update, plugin, settings, Stack, Row, Heading, Text, Button, Input, Textarea, Select, List, ListItem, Separator, Callout, Collapsible, Checkbox, Skeleton, Table, Link, CodeView, type PanelContext } from 'orca'
 
 type Draft = { text: string; id: string }
-const snapshot = atom<any>(null), error = atom(''), busy = atom(false), page = atom('overview'), selectedProject = atom(''), selectedTicket = atom(''), selectedTrigger = atom(''), query = atom('')
+const snapshot = atom<any>(null), error = atom(''), busy = atom(false), page = atom('settings'), selectedProject = atom(''), selectedTicket = atom(''), selectedTrigger = atom(''), query = atom('')
 const drafts = atom<Record<string, Draft>>('drafts', {}, { persist: 'plugin' })
 const viewedResults = atom<Record<string, boolean>>('viewed-results', {}, { persist: 'plugin' })
 const connected = atom<boolean | null>(null), lastRead = atom(''), configuredDir = atom(''), snapshotDir = atom('')
@@ -116,6 +116,8 @@ export default function Panel() {
   const deliveryLabel = (m: any) => m.status === 'sent' ? (m.channel?.source === 'panel' ? '已保存到面板对话' : `已发送至 ${m.channel?.source || '来源'}`) : m.status === 'pending' ? '待发送' : m.status || '状态未知'
   return <Stack gap="md">
     <Row justify="between"><Heading>OSA</Heading><Button variant="ghost" icon="refresh" onPress={refresh}>刷新</Button></Row>
+    <Button icon="open-external" disabled={read(busy) || !read(stateDir).trim()} onPress={async () => { set(busy, true); try { await plugin.request('osa.open-workbench', {}); set(error, '') } catch (e) { set(error, String(e)) } finally { set(busy, false) } }}>打开任务工作台</Button>
+    <Text size="xs" muted>日期、项目和工作树视图在主区域标签页中打开。</Text>
     <Row gap="xs" wrap><Button variant={current === 'overview' ? 'solid' : 'ghost'} onPress={() => { set(page, 'overview'); set(selectedProject, '') }}>总览</Button><Button variant={current === 'settings' ? 'solid' : 'ghost'} onPress={() => set(page, 'settings')}>设置</Button></Row>
     {err && read(connected) !== false && <Callout tone="danger" title="操作失败">{err}</Callout>}
     {read(connected) === false && <Callout tone="warning" title="服务未连接">{data ? `显示 ${read(lastRead)} 的记录，可能已过期。` : '请检查连接设置。'}{data && read(snapshotDir) !== read(configuredDir) ? ' 当前设置目录与记录来源不同；旧数据仅供查看。' : ''}</Callout>}

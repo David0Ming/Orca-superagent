@@ -10,7 +10,7 @@ The owner manages work across projects inside Orca, often while other agents are
 
 ## Product Purpose
 
-Make requests, questions, progress and outcomes traceable and actionable without opening every agent window.
+Make requests, questions, progress and outcomes traceable and actionable without opening every agent window. The main-area OSA workbench groups the same topics by date, project and worktree; the sidebar keeps configuration and a launcher. A project column is entry context for Router judgment, not an immutable execution target.
 
 ## Brand Personality
 

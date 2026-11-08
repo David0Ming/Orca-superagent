@@ -1,9 +1,25 @@
 import { connect } from 'node:net'
 import { isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import type { OrcaWorkerApi } from 'orca/worker'
 
 export default function activate(orca: OrcaWorkerApi): void {
+  orca.panels.handle('osa.open-workbench', async () => {
+    const stateDir = await orca.settings.get('stateDir')
+    if (typeof stateDir !== 'string' || !isAbsolute(stateDir)) throw new Error('请先填写 OSA 状态目录。')
+    const file = join(stateDir, '工作台.osaworkbench')
+    await mkdir(stateDir, { recursive: true, mode: 0o700 })
+    try { await writeFile(file, '{"kind":"osa-workbench","version":1}\n', { flag: 'wx', mode: 0o600 }) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ORCA_')))
+    const { stdout } = await promisify(execFile)(process.env.ORCA_CLI_COMMAND || 'orca', ['plugin', 'open', 'local.osa', '--editor', file, '--json'], { env, timeout: 15000 })
+    const response = JSON.parse(stdout)
+    if (!response.ok) throw new Error(response.error?.message || '无法打开 OSA 工作台')
+    return { opened: true, file }
+  })
   orca.panels.handle('osa.call', async (input: any) => {
     const stateDir = await orca.settings.get('stateDir')
     if (typeof stateDir !== 'string' || !isAbsolute(stateDir)) throw new Error('请在 Orca 插件设置中填写 OSA 状态目录的绝对路径。')

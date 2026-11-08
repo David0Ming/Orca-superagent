@@ -131,6 +131,10 @@ describe('OrcaExecutor durable effects', () => {
     expect(spec).toContain('If a premise is false')
     expect(spec).toContain('Preserve refusals and disagreements')
     expect(spec).toContain('--report-to')
+    expect(spec).toContain('already confirmed project or repository delivery agreements')
+    expect(spec).toContain('do not invent a project rule or ask again')
+    expect(spec).toContain('full OS permissions do not authorize new scope')
+    expect(spec).not.toContain('unless the ticket explicitly authorizes it')
   })
 
   it.each(['before acceptance', 'after acceptance', 'after ack'])('recovers mailbox reports across interruption %s', async point => {

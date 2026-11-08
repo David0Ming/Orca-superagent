@@ -42,6 +42,8 @@
 
 2026-11-07 已按 [开发计划](DEVELOPMENT-20261107.md) 实现服务适配和原生插件，完成后端真实工作循环；[验证记录](VALIDATION-20261107.md) 区分了自动检查、实际宿主验证及已获批的面板联调及剩余人工交互检查。
 
+2026-11-08 已按 [工作台目标](WORKBENCH-20261108.md) 增加主区域标签页、日期／项目／工作树视图，并明确项目栏是来源上下文；[工作台验证](WORKBENCH-VALIDATION-20261108.md) 记录了跨项目路由与跨日同话题的实际结果。
+
 ## 参考依据
 
 - [原版 dsh 文档，固定版本 8c32a9d](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/docs)：各章另有对应原文链接。

@@ -277,3 +277,35 @@ test('regression: missing historical topic must not block new independent owner 
   expect(failure).toBeDefined()
   expect(f.store.list('core.trigger')).toHaveLength(1)
 })
+
+
+test('subscribed other people and apps are context with their actual identity, never new-work authority', async () => {
+  const f=fixture(); f.state.messages=[f.message('goal')]; f.save(); await f.source.tick(f.app.engine)
+  const original=f.store.list<any>('core.trigger')[0], {ticketId}=f.app.engine.decide(original.id,{kind:'accept',title:'Goal',scope:'Original goal',reason:'Owner'})
+  const ticket=f.store.tickets.get(ticketId!)!; f.app.engine.assignmentStarted(ticket.id,ticket.assignments[0].id)
+  f.load(); f.state.replies=[
+    f.message('humanfeedback',{root_id:'om_goal',thread_id:'omt_thread',sender:{id:'ou_reviewer',id_type:'open_id',sender_type:'user'}}),
+    f.message('botfeedback',{root_id:'om_goal',thread_id:'omt_thread',sender:{id:'cli_ci',sender_type:'app'}}),
+    f.message('historical',{root_id:'om_goal',thread_id:'omt_thread',create_time:'1',sender:{id:'cli_ci',sender_type:'app'}})
+  ]; f.save(); await f.source.tick(f.app.engine)
+  const feedback=f.store.list<any>('core.trigger').filter(trigger=>trigger.id!==original.id)
+  expect(feedback.map(trigger=>[trigger.actor.id,trigger.human])).toEqual([['ou_reviewer',true],['cli_ci',false]])
+  expect(f.store.tickets.get(ticket.id)?.mandate).toEqual(ticket.mandate)
+  for(const trigger of feedback) {
+    expect(f.store.triggers.disposition(trigger.id)?.fanout).toEqual([ticket.id])
+    expect(()=>f.app.engine.decide(trigger.id,{kind:'accept',title:'Unauthorized',scope:'New work',reason:'No'})).toThrow()
+  }
+  expect(f.store.tickets.get(ticket.id)?.inputs.filter(input=>input.kind==='trigger')).toHaveLength(2)
+  f.mail('one'); await f.source.tick(f.app.engine); await f.source.tick(f.app.engine)
+  expect(f.store.list('core.trigger')).toHaveLength(3)
+  f.load(); expect(f.state.calls.filter(args=>args[1]==='+messages-reply')).toHaveLength(1)
+})
+
+test('an unapproved sender on a different Feishu topic cannot originate work or become the owner', async () => {
+  const f=fixture()
+  f.state.messages=[f.message('other',{sender:{id:'ou_other',id_type:'open_id',sender_type:'user'}}),f.message('bot',{sender:{id:'cli_ci',sender_type:'app'},thread_id:'omt_other'})]
+  f.save(); await f.source.tick(f.app.engine)
+  expect(f.store.tickets.list()).toHaveLength(0)
+  expect(f.store.list('candidate')).toHaveLength(0)
+  expect(f.store.list('core.trigger')).toHaveLength(0)
+})

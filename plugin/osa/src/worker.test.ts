@@ -1,5 +1,5 @@
 import { createServer } from 'node:net'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
@@ -30,5 +30,26 @@ test('sends the owner request through the configured socket', async () => {
     await worker.deactivate()
     await new Promise<void>(resolve => server.close(() => resolve()))
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('opens one workbench marker through the public editor command and preserves its file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'osa-open-')), cli = join(dir, 'orca'), log = join(dir, 'args.json')
+  writeFileSync(cli, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(log)},JSON.stringify(process.argv.slice(2)));console.log(JSON.stringify({ok:true,result:{kind:'editor'}}));\n`, {mode:0o700})
+  const previous = process.env.ORCA_CLI_COMMAND
+  process.env.ORCA_CLI_COMMAND = cli
+  const worker = await mountWorker(main, {host:mockHost({capabilities:['settings:own'],settings:{stateDir:dir}})})
+  try {
+    const opened = await worker.request('osa.open-workbench', {}) as {opened:boolean;file:string}
+    assert.equal(opened.opened, true)
+    assert.deepEqual(JSON.parse(readFileSync(log,'utf8')), ['plugin','open','local.osa','--editor',opened.file,'--json'])
+    assert.equal(JSON.parse(readFileSync(opened.file,'utf8')).kind,'osa-workbench')
+    writeFileSync(opened.file,'preserve existing document')
+    await worker.request('osa.open-workbench', {})
+    assert.equal(readFileSync(opened.file,'utf8'),'preserve existing document')
+  } finally {
+    await worker.deactivate()
+    if (previous === undefined) delete process.env.ORCA_CLI_COMMAND; else process.env.ORCA_CLI_COMMAND = previous
+    rmSync(dir,{recursive:true,force:true})
   }
 })

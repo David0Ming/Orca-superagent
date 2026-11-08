@@ -1,5 +1,12 @@
-import { assert, mockHost, mount, test } from 'orca/testing'
+import { mockHost, mount, test } from 'orca/testing'
+import assert from 'node:assert/strict'
 import * as panel from './panel'
+
+async function mountLegacy(options: Parameters<typeof mount>[1]) {
+  const view = await mount(panel, options)
+  await view.press({ text: '总览' })
+  return view
+}
 
 test('refresh and failed submit preserve draft and retry identity', async () => {
   const submissions: any[] = []
@@ -10,7 +17,7 @@ test('refresh and failed submit preserve draft and retry identity', async () => 
     if (submissions.length === 1) throw new Error('offline')
     return { id: options.id }
   } } })
-  const view = await mount(panel, { host })
+  const view = await mountLegacy({ host })
   await view.press({ text: '示例工程' })
   await view.type({ label: '你的要求' }, '保留原话')
   await view.press({ text: '刷新' })
@@ -29,7 +36,7 @@ test('opens a project task from its table', async () => {
   const ticket = { id: 't', title: '修复问题', assignments: [], inputs: [], origin: { triggerIds: [] }, undelivered: [], mandate: { scope: '请修复' } }
   const status = { stateDir: '/state', tickets: [ticket], projects: { projects: [{ id: 'p', name: '示例工程' }], components: [], locations: [], tasks: [{ ticket, context: { target: { projectId: 'p' } } }] }, triggers: [], candidates: [] }
   const host = mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } })
-  const view = await mount(panel, { host })
+  const view = await mountLegacy({ host })
   try {
     await view.press({ text: '示例工程' })
     assert.deepEqual(view.rowsOf({ label: '项目任务' }), ['t'])
@@ -51,7 +58,7 @@ test('links and opens the selected observed window', async () => {
     if (action === 'window-open') return { navigated: false, reason: '当前接口无法导航' }
     return status
   } } })
-  const view = await mount(panel, { host })
+  const view = await mountLegacy({ host })
   try {
     await view.press({ text: '窗口项目' })
     await view.activateRow({ label: '项目任务' }, 't')
@@ -72,7 +79,7 @@ test('shows running executor and saved request without inventing delivery', asyn
   const ticket = { id: 't', title: '工作', execution: { name: 'branch-name' }, assignments: [{ id: 'a', state: 'running' }], inputs: [], origin: { triggerIds: [] }, undelivered: [], mandate: { scope: '工作' } }
   const trigger = { id: 'new', source: 'panel', text: '这是真实原话', at: 'today', meta: { projectId: 'p' } }
   const status = { stateDir: '/state', tickets: [ticket], executions: [{ id: 'a', ticketId: 't', provider: 'codex', model: 'model' }], routerHealth: { binding: null }, projects: { projects: [{ id: 'p', name: '状态项目' }], components: [], locations: [], tasks: [{ ticket, context: { target: { projectId: 'p' }, targets: [{ repository: '/repo' }], workspaces: [{ directory: '/work', repository: '/repo' }] } }] }, triggers: [trigger], candidates: [{ triggers: [trigger] }], routingHistory: [], publications: [{ ticketId: 't', repository: 'owner/repo', pr: 42, url: 'https://github.com/owner/repo/pull/42' }], outbox: [{ ticketId: 't', status: 'sent', channel: { source: 'github' }, text: '回复内容' }] }
-  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
+  const view = await mountLegacy({ host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
   try {
     assert.ok(view.find({ text: /Router 未绑定/ }))
     await view.press({ text: '状态项目' })
@@ -99,7 +106,7 @@ test('failed refresh marks retained data stale without confusing action failure 
     if (action === 'status') { if (offline) throw new Error('offline'); return status }
     throw new Error('action failed')
   } } })
-  const view = await mount(panel, { host })
+  const view = await mountLegacy({ host })
   try {
     await view.toggle({ label: '添加项目' })
     await view.type({ label: '项目名称' }, '新项目')
@@ -118,7 +125,7 @@ test('failed refresh marks retained data stale without confusing action failure 
 test('viewed ready report leaves attention until a new report arrives', async () => {
   const ticket = { id: 't', title: '已完成的工作', ended: { outcome: 'completed' }, assignments: [{ id: 'a', state: 'ended', report: { state: 'ready', at: 'first', summary: '结果一' } }], inputs: [], origin: { triggerIds: [] }, undelivered: [], mandate: { scope: '工作' } }
   const status = { stateDir: '/one', tickets: [ticket], projects: { projects: [{ id: 'p', name: '项目' }], components: [], locations: [], tasks: [{ ticket, context: { target: { projectId: 'p' } } }] }, triggers: [] }
-  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], settings: { stateDir: '/configured-alias' }, requests: { 'osa.call': () => status } }) })
+  const view = await mountLegacy({ host: mockHost({ capabilities: ['settings:own'], settings: { stateDir: '/configured-alias' }, requests: { 'osa.call': () => status } }) })
   try {
     assert.match(JSON.stringify(view.tree()), /已完成的工作/)
     await view.press({ label: '已完成的工作' })
@@ -142,7 +149,7 @@ test('reevaluates only unavailable original requests and waits once candidate ex
   const active = { id: 'panel:active', source: 'panel', text: '正在处理', at: 'today', meta: { projectId: 'p' } }
   const status = { stateDir: '/state', tickets: [], projects: { projects: [{ id: 'p', name: '项目甲' }], components: [], locations: [], tasks: [] }, triggers: [original, active], candidates: [{ triggers: [active] }], routingHistory: [{ id: 'd1', kind: 'unavailable', at: 'one', triggerIds: [original.id] }, { id: 'd2', kind: 'unavailable', at: 'one', triggerIds: [active.id] }], triggerDispositions: [{ triggerId: original.id, decisionId: 'd1' }, { triggerId: active.id, decisionId: 'd2' }] }
   const calls: any[] = []
-  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': ({ action, options }: any) => {
+  const view = await mountLegacy({ host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': ({ action, options }: any) => {
     calls.push({ action, options })
     if (action === 'reevaluate') { status.candidates.push({ triggers: [original] }); return { triggerId: original.id, requeued: true } }
     return status
@@ -171,7 +178,7 @@ test('switching state directories blocks stale actions and keeps each draft sepa
     }
     return {}
   } } })
-  const view = await mount(panel, { host })
+  const view = await mountLegacy({ host })
   try {
     await view.press({ text: '共同项目' })
     await view.type({ label: '你的要求' }, 'A 的草稿')
@@ -206,7 +213,7 @@ test('conversation follows recorded times and retains legacy replies without dup
   const final = { state: 'ready', at: time(5), summary: '最终结果原文' }
   const ticket = { id: 't', title: '对话测试', assignments: [{ id: 'a', state: 'ended', report: final }], inputs: [{ id: 'i', kind: 'trigger', triggerId: 'two', readAt: time(4) }], origin: { triggerIds: ['one'] }, undelivered: [], mandate: { scope: '工作' } }
   const status = { stateDir: '/state', tickets: [ticket], projects: { projects: [{ id: 'p', name: '对话项目' }], components: [], locations: [], tasks: [{ ticket, context: { target: { projectId: 'p' } } }] }, triggers: [answer, first], reportReceipts: [{ ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: final }] } }, { ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: progress }] } }, { ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: { ...progress, summary: '同毫秒的另一进展' } }] } }, { ticketId: 't', assignmentId: 'a', result: { assignments: [{ id: 'a', report: final }] } }], outbox: [{ ticketId: 't', text: '最终结果原文', status: 'sent', createdAt: time(5), channel: { source: 'panel' } }, { ticketId: 't', text: '需要回答的问题', status: 'sent', createdAt: time(3), channel: { source: 'panel' } }, { ticketId: 't', text: '旧的无时间回复', status: 'sent', channel: { source: 'github' } }] }
-  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
+  const view = await mountLegacy({ host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
   try {
     await view.press({ text: '对话项目' })
     await view.activateRow({ label: '项目任务' }, 't')
@@ -232,7 +239,7 @@ test('external human retains their identity in task conversation', async () => {
   const external = { id: 'review', source: 'github', actor: { source: 'github', id: '99' }, human: true, at: '2026-11-07T07:00:00Z', text: '协作者的评论' }
   const ticket = { id: 't', title: '协作任务', assignments: [], inputs: [{ id: 'i', kind: 'trigger', triggerId: 'review' }], origin: { triggerIds: [] }, undelivered: ['i'], mandate: { scope: '工作' } }
   const status = { stateDir: '/state', tickets: [ticket], projects: { projects: [{ id: 'p', name: '协作项目' }], components: [], locations: [], tasks: [{ ticket, context: { target: { projectId: 'p' } } }] }, triggers: [external] }
-  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
+  const view = await mountLegacy({ host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
   try {
     await view.press({ text: '协作项目' })
     await view.activateRow({ label: '项目任务' }, 't')
@@ -245,7 +252,7 @@ test('external human retains their identity in task conversation', async () => {
 test('ignored status query keeps its exact-thread replies and shows new replies as unread', async () => {
   const trigger = { id: 'panel:query', source: 'panel', human: true, at: '2026-11-07T07:00:00Z', text: '查询状态', channel: { source: 'panel', thread: 'request:query' }, meta: { projectId: 'p' } }
   const status = { stateDir: '/state', tickets: [], projects: { projects: [{ id: 'p', name: '查询项目' }], components: [], locations: [], tasks: [] }, triggers: [trigger], candidates: [], routingHistory: [{ id: 'd', kind: 'ignore', triggerIds: [trigger.id] }], triggerDispositions: [{ triggerId: trigger.id, decisionId: 'd' }], outbox: [{ id: 'reply1', kind: 'reply', status: 'sent', createdAt: '2026-11-07T07:01:00Z', channel: { source: 'panel', thread: 'request:query' }, text: '查询结果' }, { id: 'other', kind: 'reply', status: 'sent', createdAt: '2026-11-07T07:01:00Z', channel: { source: 'panel', thread: 'request:other' }, text: '无关内容' }, { id: 'foreign', kind: 'reply', status: 'sent', createdAt: '2026-11-07T07:01:00Z', channel: { source: 'github', thread: 'request:query' }, text: '其他来源' }] }
-  const view = await mount(panel, { host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
+  const view = await mountLegacy({ host: mockHost({ capabilities: ['settings:own'], requests: { 'osa.call': () => status } }) })
   try {
     assert.ok(view.find({ label: '未读请求回复' }))
     await view.press({ label: '查询状态' })
@@ -267,4 +274,16 @@ test('ignored status query keeps its exact-thread replies and shows new replies 
     assert.deepEqual(view.errors, [])
     assert.deepEqual(view.warnings, [])
   } finally { await view.unmount() }
+})
+
+
+test('sidebar opens the main-area workbench through its dedicated handler', async () => {
+  let opened = 0
+  const view = await mount(panel, {host:mockHost({capabilities:['settings:own'],settings:{stateDir:'/state'},requests:{'osa.call':()=>({stateDir:'/state',tickets:[],projects:{projects:[]}}),'osa.open-workbench':()=>{opened++;return {opened:true,file:'/state/工作台.osaworkbench'}}}})})
+  try {
+    assert.ok(view.find({label:'状态目录（绝对路径）'}))
+    await view.press({text:'打开任务工作台'})
+    assert.equal(opened,1)
+    assert.deepEqual(view.errors,[])
+  } finally {await view.unmount()}
 })

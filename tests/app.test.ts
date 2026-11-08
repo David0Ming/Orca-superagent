@@ -251,7 +251,7 @@ test('generic targets, lease-guarded management and cross-entry attachment keep 
   call(['route','attach'], {ticket:a,trigger:remote.id})
   call(['route','attach'], {ticket:a,trigger:remote.id})
   expect(store.tickets.get(a)!.inputs.filter(input=>input.kind==='trigger'&&input.triggerId===remote.id)).toHaveLength(1)
-  expect(() => call(['route','attach'], {ticket:b,trigger:remote.id})).toThrow('another ticket')
+  expect(() => call(['route','attach'], {ticket:b,trigger:remote.id})).toThrow('worker decides')
   expect(store.list('launch')).toHaveLength(2)
   const target = store.get('ticket-target', a)
   call(['project','update'], {id:'arbitrary-a',name:'Renamed'})
@@ -449,7 +449,7 @@ test('owner comments attach once, preserve mandate and return answers and result
   f.store.put('config','two-layer',true)
   f.call(['report','ready'],{...auth,summary:'Cause fixed'})
   const status=owner('status'), mails=status.outbox.filter((mail:any)=>mail.channel.source==='panel')
-  expect(mails).toEqual(expect.arrayContaining([expect.objectContaining({text:'Which date?',status:'sent'}),expect.objectContaining({text:'Timezone preserved',status:'sent',channel:expect.objectContaining({thread:`task:${ticketId}`})}),expect.objectContaining({text:'Cause fixed',status:'sent'})]))
+  expect(mails).toEqual(expect.arrayContaining([expect.objectContaining({text:'Which date?',status:'sent'}),expect.objectContaining({text:'Timezone preserved',triggerId:'panel:comment',status:'sent',channel:expect.objectContaining({thread:'request:panel:task'})}),expect.objectContaining({text:'Cause fixed',status:'sent'})]))
   expect(status.inputResolutions).toEqual([expect.objectContaining({inputId:input.id,summary:'Timezone preserved'})])
   expect(f.call(['router','wait']).messages).toEqual([])
   owner('comment',{id:'after-result',ticket:ticketId,text:'Verify another export'})
@@ -492,7 +492,7 @@ test('owner stop records the actual owner and refuses further comments without a
 })
 
 
-test('panel attachment cannot cross the original project or selected repositories', () => {
+test('panel source context cannot change the accepted target and cross-project routing keeps its reason', () => {
   const f=setup(), owner=(action:string,options:Record<string,string>)=>f.app.handle({command:['owner',action],options,id:'rpc'}) as any
   for(const project of ['a','b']) owner('project-add',{id:project,name:project})
   for(const [id,project] of [['a1','a'],['a2','a'],['b1','b']]) {
@@ -503,17 +503,22 @@ test('panel attachment cannot cross the original project or selected repositorie
   const {ticketId}=f.call(['route','accept'],{trigger:'panel:original',title:'A'})
   const target=f.store.get('ticket-target',ticketId), mandate=f.store.tickets.get(ticketId)?.mandate
   owner('request',{id:'foreign-project',project:'b',locations:'b1',text:'Fix project B'})
-  expect(()=>f.call(['route','attach'],{ticket:ticketId,trigger:'panel:foreign-project'})).toThrow('another project')
+  expect(()=>f.call(['route','attach'],{ticket:ticketId,trigger:'panel:foreign-project'})).toThrow('reason')
   owner('request',{id:'foreign-repository',project:'a',locations:'a2',text:'Change another repository'})
-  expect(()=>f.call(['route','attach'],{ticket:ticketId,trigger:'panel:foreign-repository'})).toThrow('outside this task')
-  expect(()=>owner('comment',{id:'outside-comment',ticket:ticketId,locations:'a2',text:'Expand this task'})).toThrow('outside this task')
-  expect(f.store.tickets.get(ticketId)?.inputs).toHaveLength(0)
+  f.call(['route','attach'],{ticket:ticketId,trigger:'panel:foreign-repository'})
+  owner('comment',{id:'outside-comment',ticket:ticketId,locations:'a2',text:'This may need a change in the other repository'})
+  expect(f.store.triggers.get('panel:outside-comment')?.meta.locationIds).toEqual(['a2'])
+  expect(f.store.tickets.get(ticketId)?.inputs).toHaveLength(2)
   expect(f.store.get('ticket-target',ticketId)).toEqual(target)
   expect(f.store.tickets.get(ticketId)?.mandate).toEqual(mandate)
-  expect(f.call(['owner','status']).candidates.flatMap((candidate:any)=>candidate.triggers.map((trigger:any)=>trigger.id))).toEqual(expect.arrayContaining(['panel:foreign-project','panel:foreign-repository']))
+  expect(f.call(['owner','status']).candidates.flatMap((candidate:any)=>candidate.triggers.map((trigger:any)=>trigger.id))).toEqual(expect.arrayContaining(['panel:foreign-project']))
   owner('request',{id:'same-target',project:'a',locations:'a1',text:'Another clue'})
   f.call(['route','attach'],{ticket:ticketId,trigger:'panel:same-target'})
-  expect(f.store.tickets.get(ticketId)?.inputs).toHaveLength(1)
+  expect(f.store.tickets.get(ticketId)?.inputs).toHaveLength(3)
+  f.call(['route','attach'],{ticket:ticketId,trigger:'panel:foreign-project',reason:'The request describes the existing A behavior'})
+  expect(f.store.get('ticket-target',ticketId)).toEqual(target)
+  expect(f.store.triggers.get('panel:foreign-project')?.meta.projectId).toBe('b')
+  expect(f.call(['owner','status']).routingAttachments).toEqual([expect.objectContaining({ticketId,triggerId:'panel:foreign-project',reason:'The request describes the existing A behavior'})])
 })
 
 
@@ -548,14 +553,15 @@ test('only Router candidate reads start the core deadline, whose bounded retries
   expect(f.store.get('router','lease')).toEqual(lease)
 })
 
-test('owner reevaluation cannot steal an active ticket input or admit a foreign actor', () => {
+test('owner reevaluation can reroute owned inputs while Router cannot hijack them or admit a foreign actor', () => {
   const f=setup(); f.call(['intake'],{id:'original',text:'Do the authorized work'})
   const {ticketId}=f.call(['route','accept'],{trigger:'original',title:'Work'})
   f.call(['intake'],{id:'owned-followup',text:'A clue within the task'})
   f.call(['route','attach'],{ticket:ticketId,trigger:'owned-followup'})
-  const disposition=f.store.triggers.disposition('owned-followup')
-  expect(()=>f.call(['owner','reevaluate'],{trigger:'owned-followup'})).toThrow('worker decides')
-  expect(f.store.triggers.disposition('owned-followup')).toEqual(disposition)
+  expect(()=>f.call(['route','accept'],{trigger:'owned-followup',title:'Hijacked'})).toThrow('worker decides')
+  expect(f.call(['owner','reevaluate'],{trigger:'owned-followup'})).toEqual({triggerId:'owned-followup',requeued:true})
+  expect(f.store.triggers.disposition('owned-followup')?.requeued).toBe(true)
+  expect(f.call(['owner','reevaluate'],{trigger:'owned-followup'})).toEqual({triggerId:'owned-followup',requeued:false})
   f.app.engine.receive({id:'foreign-reevaluate',source:'router',actor:{source:'router',id:'someone-else'},human:true,addressed:'direct',at:new Date().toISOString(),text:'Not owner work',threads:[{source:'router',id:'foreign-reevaluate'}],meta:{}})
   expect(()=>f.call(['owner','reevaluate'],{trigger:'foreign-reevaluate'})).toThrow('Only in-scope owner')
   expect(()=>f.call(['owner','reevaluate'],{trigger:'missing'})).toThrow('Only in-scope owner')
@@ -576,4 +582,222 @@ test('unavailable panel requests recover in their original project with unchange
   expect(f.call(['owner','reevaluate'],{trigger:'panel:panel-request',project:'p'})).toEqual({triggerId:'panel:panel-request',requeued:true})
   expect(f.store.triggers.get('panel:panel-request')).toEqual(trigger)
   expect(f.call(['owner','status'],{project:'p'}).candidates[0].triggers[0]).toMatchObject({id:'panel:panel-request',source:'panel',text:original.text,meta:{projectId:'p'}})
+})
+
+
+test('pending request comments keep one topic, native candidate batches and exact originals through acceptance', () => {
+  vi.useFakeTimers({toFake:['Date']}); vi.setSystemTime('2026-11-08T03:00:00Z')
+  const f=setup(), owner=(action:string,options:Record<string,string>)=>f.call(['owner',action],options)
+  execFileSync('git',['init','-q',f.dir]); owner('project-add',{id:'p',name:'Project'}); owner('repository-add',{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  const original={id:'topic',project:'p',locations:'repo',text:'  Fix exported dates  '}
+  owner('request',original)
+  const first=f.call(['owner','status']).candidates[0]
+  vi.setSystemTime('2026-11-09T03:00:00Z')
+  const comment={id:'clarification',trigger:'panel:topic',text:'  Keep the existing timezone.\nOnly change the export.  '}
+  owner('comment',comment); owner('comment',comment)
+  const topic=f.store.triggers.get('panel:topic')!, reply=f.store.triggers.get('panel:clarification')!
+  expect(reply).toMatchObject({text:comment.text,at:'2026-11-09T03:00:00.000Z',threads:topic.threads,channel:topic.channel,meta:{projectId:'p',topicTriggerId:topic.id,entryProjectId:'p',locationIds:['repo']}})
+  const waiting=f.call(['router','wait'])
+  expect(waiting.candidates[0].evalId).toBe(first.evalId)
+  expect(waiting.candidates[0].triggers.map((trigger:any)=>trigger.id)).toEqual([topic.id])
+  expect(f.store.threads.get('panel:request:panel:topic')?.pending).toEqual([reply.id])
+  expect(waiting.topicInputs.map((trigger:any)=>trigger.id)).toEqual([topic.id,reply.id])
+  const {ticketId}=f.call(['route','accept'],{trigger:topic.id,title:'Export dates'})
+  const ticket=f.store.tickets.get(ticketId)!
+  expect(ticket.mandate.scope).toBe(original.text)
+  expect(ticket.inputs.filter(input=>input.kind==='trigger'&&input.triggerId===reply.id)).toHaveLength(1)
+  owner('comment',comment)
+  expect(f.store.triggers.get(reply.id)).toEqual(reply)
+  expect(()=>owner('comment',{...comment,text:'Edited original'})).toThrow('different content')
+  owner('comment',{id:'after-accept',trigger:topic.id,text:'Another clue'})
+  expect(f.store.tickets.list()).toHaveLength(1)
+  expect(f.store.tickets.get(ticketId)?.inputs.filter(input=>input.kind==='trigger')).toHaveLength(2)
+  owner('stop',{ticket:ticketId,reason:'Stop this work'})
+  expect(()=>owner('comment',{id:'after-stop',trigger:topic.id,text:'Resume'})).toThrow('stopped')
+})
+
+test('ignored query topics receive followup requests without losing the earlier question and reply', () => {
+  const f=setup(); f.call(['owner','project-add'],{id:'p',name:'Project'})
+  f.call(['owner','request'],{id:'question',project:'p',text:'What does this project do?'})
+  f.call(['route','ignore'],{trigger:'panel:question',reason:'Answered as a query'})
+  f.call(['reply'],{trigger:'panel:question',text:'It exports reports.'})
+  f.call(['owner','comment'],{id:'followup',trigger:'panel:question',text:'Which timezone does it use?'})
+  const waiting=f.call(['router','wait'])
+  expect(waiting.candidates[0].triggers.map((trigger:any)=>trigger.id)).toEqual(['panel:followup'])
+  expect(waiting.topicInputs.map((trigger:any)=>trigger.text)).toEqual(['What does this project do?','Which timezone does it use?'])
+  expect(waiting.topicReplies).toEqual([expect.objectContaining({text:'It exports reports.'})])
+  expect(f.call(['owner','status']).outbox).toEqual([expect.objectContaining({text:'It exports reports.',channel:expect.objectContaining({thread:'request:panel:question'})})])
+  expect(f.store.tickets.list()).toHaveLength(0)
+  expect(()=>f.call(['owner','comment'],{id:'bad',trigger:'panel:question',ticket:'made-up',text:'Ambiguous'})).toThrow('exactly one')
+  expect(()=>f.call(['owner','comment'],{id:'bad',text:'No topic'})).toThrow('exactly one')
+  expect(()=>f.call(['owner','comment'],{id:'bad',trigger:'missing',text:'Unknown topic'})).toThrow('original')
+})
+
+test('project is entry context: Router may route elsewhere with reason and later comments keep the original reply channel', () => {
+  const f=setup()
+  for(const project of ['a','b']) {
+    f.call(['owner','project-add'],{id:project,name:project})
+    const repository=join(f.dir,project); execFileSync('git',['init','-q',repository])
+    f.call(['owner','repository-add'],{id:project,name:project,project,repository})
+  }
+  f.call(['owner','request'],{id:'entry-a',project:'a',locations:'a',text:'Fix the report described here'})
+  f.call(['owner','comment'],{id:'before-route',trigger:'panel:entry-a',text:'The failure is in the shared export code'})
+  const original=f.store.triggers.get('panel:entry-a')!, prior=f.store.triggers.get('panel:before-route')!
+  expect(()=>f.call(['route','accept'],{trigger:original.id,project:'b',title:'Report'})).toThrow('reason')
+  const {ticketId}=f.call(['route','accept'],{trigger:original.id,project:'b',title:'Report',reason:'The shared export implementation is in B'})
+  expect(f.store.get<any>('ticket-target',ticketId).projectId).toBe('b')
+  expect(f.store.triggers.get(original.id)).toEqual(original)
+  f.call(['owner','comment'],{id:'before-route',trigger:original.id,text:prior.text})
+  expect(f.store.triggers.get(prior.id)).toEqual(prior)
+  f.call(['owner','comment'],{id:'after-route',trigger:original.id,project:'b',text:'Retest the original case'})
+  const after=f.store.triggers.get('panel:after-route')!
+  expect(after).toMatchObject({meta:{projectId:'b',entryProjectId:'a',topicTriggerId:original.id},channel:original.channel,threads:original.threads})
+  expect(f.store.tickets.list()).toHaveLength(1)
+  expect(f.store.tickets.get(ticketId)?.mandate.scope).toBe(original.text)
+  expect(f.store.tickets.get(ticketId)?.inputs.some(input=>input.kind==='trigger'&&input.triggerId===after.id)).toBe(true)
+  expect(f.call(['owner','status']).routingHistory).toEqual(expect.arrayContaining([expect.objectContaining({ticketId,reason:expect.arrayContaining([expect.objectContaining({code:'said',values:{text:'The shared export implementation is in B'}})])})]))
+})
+
+
+test('a handed-back panel followup can route to another project while a Router cannot steal owned work', () => {
+  const f=setup()
+  for(const project of ['a','b']) {
+    f.call(['owner','project-add'],{id:project,name:project})
+    const repository=join(f.dir,project); execFileSync('git',['init','-q',repository])
+    f.call(['owner','repository-add'],{id:project,name:project,project,repository})
+    f.call(['owner','request'],{id:project,project,text:`Work in ${project}`})
+  }
+  const a=f.call(['route','accept'],{trigger:'panel:a',title:'A'}).ticketId, b=f.call(['route','accept'],{trigger:'panel:b',title:'B'}).ticketId
+  f.call(['owner','comment'],{id:'outside',trigger:'panel:a',text:'This also needs a change in B'})
+  expect(()=>f.call(['route','attach'],{ticket:b,trigger:'panel:outside',reason:'B owns that feature'})).toThrow('worker decides')
+  expect(f.store.tickets.get(b)?.inputs).toHaveLength(0)
+  f.app.engine.handback(a,'panel:outside','This feature belongs to B')
+  f.call(['route','attach'],{ticket:b,trigger:'panel:outside',reason:'Executor A identified B as the owning project'})
+  expect(f.store.tickets.get(b)?.inputs.some(input=>input.kind==='trigger'&&input.triggerId==='panel:outside')).toBe(true)
+  expect(f.store.triggers.get('panel:outside')?.meta.projectId).toBe('a')
+  expect(f.store.triggers.disposition('panel:outside')?.handbacks).toEqual([expect.objectContaining({ticketId:a,reason:'This feature belongs to B'})])
+  expect(f.call(['owner','status']).routingAttachments).toEqual([expect.objectContaining({ticketId:b,triggerId:'panel:outside',reason:'Executor A identified B as the owning project'})])
+})
+
+
+test('a query topic accepted only on a later request continues that actual ticket', () => {
+  const f=setup(); execFileSync('git',['init','-q',f.dir])
+  f.call(['owner','project-add'],{id:'p',name:'Project'}); f.call(['owner','repository-add'],{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  f.call(['owner','request'],{id:'query-first',project:'p',text:'Can this export dates?'})
+  f.call(['route','ignore'],{trigger:'panel:query-first',reason:'A question only'})
+  f.call(['reply'],{trigger:'panel:query-first',text:'Yes, dates are supported.'})
+  f.call(['owner','comment'],{id:'request-now',trigger:'panel:query-first',text:'Fix the exported dates now'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'panel:request-now',title:'Export dates'})
+  f.call(['owner','comment'],{id:'clue',trigger:'panel:query-first',text:'Use the existing timezone'})
+  expect(f.store.tickets.list()).toHaveLength(1)
+  expect(f.store.tickets.get(ticketId)?.mandate.scope).toBe('Fix the exported dates now')
+  expect(f.store.tickets.get(ticketId)?.inputs.some(input=>input.kind==='trigger'&&input.triggerId==='panel:clue')).toBe(true)
+  expect(f.store.triggers.get('panel:clue')?.channel).toEqual(f.store.triggers.get('panel:query-first')?.channel)
+  expect(f.store.list('core.trigger')).toHaveLength(3)
+})
+
+
+test('answers to distinct original requests sharing one reply channel retain exact trigger attribution after accept', () => {
+  const f=setup()
+  for(const [id,text] of [['one','What is the first project?'],['two','What is the second project?']]) f.call(['intake'],{id,text,thread:'same-chat'})
+  f.call(['reply'],{trigger:'one',text:'Answer to one'})
+  f.call(['reply'],{trigger:'two',text:'Answer to two'})
+  let outbox=f.call(['owner','status']).outbox
+  expect(outbox).toEqual([expect.objectContaining({triggerId:'one',text:'Answer to one'}),expect.objectContaining({triggerId:'two',text:'Answer to two'})])
+  expect(outbox[0].channel).toEqual(outbox[1].channel)
+  f.call(['route','ignore'],{trigger:'two',reason:'Second question answered'})
+  expect(f.call(['router','wait']).topicReplies.map((mail:any)=>mail.triggerId)).toEqual(['one'])
+  const {ticketId}=f.call(['route','accept'],{trigger:'one',title:'First project'})
+  outbox=f.call(['owner','status']).outbox
+  expect(outbox.filter((mail:any)=>mail.triggerId==='one').map((mail:any)=>mail.text)).toEqual(['Answer to one'])
+  expect(f.store.tickets.get(ticketId)?.origin.triggerIds).toEqual(['one'])
+  expect(outbox.find((mail:any)=>mail.triggerId==='two').text).toBe('Answer to two')
+})
+
+test('a pending topic answer keeps its trigger attribution when later work in that topic is accepted', () => {
+  const f=setup(); execFileSync('git',['init','-q',f.dir])
+  f.call(['owner','project-add'],{id:'p',name:'Project'}); f.call(['owner','repository-add'],{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  f.call(['owner','request'],{id:'answered-topic',project:'p',text:'Does this export dates?'})
+  f.call(['route','ignore'],{trigger:'panel:answered-topic',reason:'A query'})
+  f.call(['reply'],{trigger:'panel:answered-topic',text:'Yes, dates are supported.'})
+  const reply=f.call(['owner','status']).outbox[0]
+  f.call(['owner','comment'],{id:'accepted-followup',trigger:'panel:answered-topic',text:'Fix the date export'})
+  const {ticketId}=f.call(['route','accept'],{trigger:'panel:accepted-followup',title:'Dates'})
+  expect(f.call(['owner','status']).outbox.find((mail:any)=>mail.id===reply.id)).toEqual(expect.objectContaining({triggerId:'panel:answered-topic',text:'Yes, dates are supported.'}))
+  expect(f.store.triggers.get('panel:accepted-followup')?.meta.topicTriggerId).toBe('panel:answered-topic')
+  expect(f.store.tickets.get(ticketId)?.origin.triggerId).toBe('panel:accepted-followup')
+})
+
+
+test('accepting handed-back work never sweeps historical sibling inputs out of the original task', () => {
+  const f=setup()
+  for(const project of ['a','b']) {
+    f.call(['owner','project-add'],{id:project,name:project})
+    const repository=join(f.dir,project); execFileSync('git',['init','-q',repository])
+    f.call(['owner','repository-add'],{id:project,name:project,project,repository})
+  }
+  f.call(['owner','request'],{id:'initial-a',project:'a',text:'Fix A'})
+  const a=f.call(['route','accept'],{trigger:'panel:initial-a',title:'A'}).ticketId
+  f.call(['owner','comment'],{id:'owned-clue',trigger:'panel:initial-a',text:'The A failure occurs on export'})
+  f.call(['owner','comment'],{id:'outside-b',trigger:'panel:initial-a',text:'Fix the unrelated B issue'})
+  f.app.engine.handback(a,'panel:outside-b','B is a separate goal')
+  const aBefore=f.store.tickets.get(a)!
+  const {ticketId:b}=f.call(['route','accept'],{trigger:'panel:outside-b',project:'b',title:'B',reason:'A handed back this separate B request'})
+  expect(b).not.toBe(a)
+  expect(f.store.tickets.get(a)).toEqual(aBefore)
+  expect(f.store.tickets.get(b)?.mandate.scope).toBe('Fix the unrelated B issue')
+  expect(f.store.tickets.get(b)?.origin.triggerIds).toEqual(['panel:outside-b'])
+  expect(f.store.tickets.get(b)?.inputs.some(input=>input.kind==='trigger'&&input.triggerId==='panel:owned-clue')).toBe(false)
+  expect(f.store.triggers.disposition('panel:owned-clue')?.fanout).toEqual([a])
+  expect(f.store.triggers.disposition('panel:outside-b')?.handbacks).toEqual([expect.objectContaining({ticketId:a,reason:'B is a separate goal'})])
+  expect(f.store.tickets.list()).toHaveLength(2)
+  expect(f.store.list('core.trigger')).toHaveLength(3)
+})
+
+test('an unassigned owner Router request accepts workbench comments on its original native thread', () => {
+  const f=setup()
+  f.call(['intake'],{id:'router-topic',text:'  Fix the report  ',thread:'shared-router-chat'})
+  const original=f.store.triggers.get('router-topic')!
+  const comment={id:'router-clarification',trigger:original.id,text:'  It fails when exporting dates  '}
+  expect(f.call(['owner','comment'],comment)).toEqual({id:'panel:router-clarification',result:'stored'})
+  expect(f.call(['owner','comment'],comment).result).toBe('duplicate')
+  const reply=f.store.triggers.get('panel:router-clarification')!
+  expect(reply).toMatchObject({source:'panel',actor:{source:'panel',id:'owner'},text:comment.text,threads:original.threads,channel:original.channel,meta:{topicTriggerId:original.id}})
+  expect(reply.meta).not.toHaveProperty('projectId')
+  expect(reply.meta).not.toHaveProperty('entryProjectId')
+  expect(f.store.triggers.disposition(reply.id)?.filtered).toBeUndefined()
+  expect(f.call(['router','wait']).topicInputs.map((trigger:any)=>trigger.id)).toEqual([original.id,reply.id])
+  expect(f.store.tickets.list()).toHaveLength(0)
+  execFileSync('git',['init','-q',f.dir])
+  f.call(['owner','project-add'],{id:'p',name:'Project'}); f.call(['owner','repository-add'],{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  const {ticketId}=f.call(['route','accept'],{trigger:original.id,project:'p',title:'Report'})
+  expect(f.store.tickets.get(ticketId)?.mandate.scope).toBe(original.text)
+  expect(f.store.tickets.get(ticketId)?.inputs.filter(input=>input.kind==='trigger'&&input.triggerId===reply.id)).toHaveLength(1)
+  f.call(['owner','comment'],{id:'after-router-accept',trigger:original.id,text:'Retest the same export'})
+  expect(f.store.triggers.get('panel:after-router-accept')).toMatchObject({source:'panel',threads:original.threads,channel:original.channel,meta:{projectId:'p',topicTriggerId:original.id}})
+  expect(f.store.tickets.list()).toHaveLength(1)
+  expect(f.store.list('core.trigger')).toHaveLength(3)
+  f.app.engine.receive({id:'foreign-topic',source:'router',actor:{source:'router',id:'other-user'},human:true,at:new Date().toISOString(),text:'Foreign owner',threads:[{source:'router',id:'foreign-topic'}],meta:{}})
+  expect(()=>f.call(['owner','comment'],{id:'foreign-comment',trigger:'foreign-topic',text:'Do not forge ownership'})).toThrow('original in-scope owner')
+})
+
+
+test('accepting a pending clarification uses the original unresolved request mandate and leaves no duplicate candidate', () => {
+  const f=setup(); execFileSync('git',['init','-q',f.dir])
+  f.call(['owner','project-add'],{id:'p',name:'Project'}); f.call(['owner','repository-add'],{id:'repo',name:'Repo',project:'p',repository:f.dir})
+  f.call(['owner','request'],{id:'export-root',project:'p',text:'  Fix exports  '})
+  f.call(['owner','comment'],{id:'timezone-clue',trigger:'panel:export-root',text:'  Keep timezone  '})
+  const decision=f.call(['route','accept'],{trigger:'panel:timezone-clue',title:'Exports'})
+  const ticket=f.store.tickets.get(decision.ticketId)!, assignment=ticket.assignments[0].id
+  expect(ticket.mandate.scope).toBe('  Fix exports  ')
+  expect(ticket.origin.triggerId).toBe('panel:export-root')
+  expect(ticket.inputs.filter(input=>input.kind==='trigger'&&input.triggerId==='panel:timezone-clue')).toHaveLength(1)
+  expect(decision.audit).toEqual({requestedTriggerId:'panel:timezone-clue',topicTriggerId:'panel:export-root'})
+  f.app.engine.evaluateDue()
+  expect(f.call(['router','wait']).candidates).toHaveLength(0)
+  f.store.put('capability',assignment,{token:'secret'}); f.app.engine.assignmentStarted(ticket.id,assignment)
+  const read=f.call(['read'],{ticket:ticket.id,assignment,token:'secret'})
+  expect(read.triggers.map((trigger:any)=>trigger.text)).toEqual(['  Fix exports  ','  Keep timezone  '])
+  expect(f.call(['route','accept'],{trigger:'panel:timezone-clue',title:'Exports'}).ticketId).toBe(ticket.id)
+  expect(f.store.tickets.list()).toHaveLength(1)
 })
