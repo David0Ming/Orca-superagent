@@ -13,6 +13,21 @@ The Executor is your peer. It owns planning, exploration, implementation and deb
 
 Use `npm run osa -- --state /absolute/state ...`. Manual startup only: opening Orca/workbench or loading this skill never starts OSA or its watchdog. First check `npm run osa:status`. When the owner explicitly asks to start OSA, run `npm run osa:start` with the existing formal configuration, then take over the Router. Otherwise report that the service is stopped. The watchdog has a separate manual start; do not start it with OSA. Do not start, stop, restart or change a business service without the owner’s authorization. Do not change Orca or vendor/dsh-core or revive the archived reliability implementation.
 
+## Manual startup and shutdown
+
+Loading this skill only loads instructions. Start only the components the owner explicitly requests; a request to start the full OSA workspace authorizes the four steps below without separate repeated confirmations. Opening Orca or receiving an old wake hint does not start them.
+
+Run OSA commands from `/Users/mzg/orca/projects/Super-agent-orca`. `ORCA` below means the current Orca CLI (`/Applications/Orca.app/Contents/Resources/bin/orca` on this machine).
+
+1. **OSA service:** check `npm run osa:status`; when requested, run `npm run osa:start`. It reads the existing formal configuration under `.osa/p4-live`. Do not install or enable automatic Supervisor startup.
+2. **Workbench:** when requested, enable the existing plugin with `ORCA plugin enable local.osa --json`, then run `ORCA plugin dev request plugin/osa osa.open-workbench --json`. This opens the existing workbench; it does not start the service or bind a Router. Preserve its configured state directory.
+3. **Router:** in the chat the owner selected, run `npm run router:takeover` after the service is running. Use its returned lease and binding; read available work once with `router wait --timeout 0`, then yield for events. Do not turn the development chat into the Router merely because this skill was loaded.
+4. **Watchdog:** when separately requested, run in a dedicated terminal: `rm -f ~/.orca/watchdog/DISABLED`, then `bash ~/.orca/watchdog/orca-watchdog-loop.sh`. Keep that foreground terminal identifiable so it can be stopped. Do not start the watchdog implicitly with the service, workbench or Router, and do not re-enable its LaunchAgent. It writes observations for OSA; it does not replace Orca's own orchestration notifications.
+
+The service, workbench and Router can be used without the watchdog. If the owner requests only one component, do not silently start the other three; explain any prerequisite that is stopped.
+
+**Manual stop:** `npm run osa:stop` stops the formal service. Stop a manually running watchdog with Ctrl+C in its dedicated terminal and restore `~/.orca/watchdog/DISABLED` with `touch`. Disable the panel worker with `ORCA plugin disable local.osa --json` when requested. Service shutdown does not itself cancel Router or Executor turns: for “stop all OSA,” cancel the bound Router turn and stop OSA-owned active Dispatches through Orca's native controls, then verify their states. Preserve tasks and history. Do not leave a Supervisor or WatchPaths/KeepAlive job able to restart them.
+
 ## Keep pushing
 
 - Once the owner has authorized a goal, keep it moving without re-confirming. Come back only for: a blank business rule, a trade-off that clearly changes the business outcome, significant cost, a security risk, or an irreversible action.
