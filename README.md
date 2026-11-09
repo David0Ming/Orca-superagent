@@ -81,7 +81,9 @@ GitHub 来源与项目仓库通过现有 component 的 GitHub 字段关联；面
 rtk proxy node scripts/osa-service.mjs stop --state /absolute/osa-state
 ```
 
-人工停止保留记录，托管器不会再次拉起；明确执行 start 后恢复。自动托管仍使用 `scripts/osa-supervisor.mjs`，配置格式见 [部署章](docs/006-deployment.md)。停止 OSA 不等于停止原生 Executor，也不删除工作区。
+2026-11-09 起仅手动启动：`npm run osa:start` 按现有正式配置启动，`npm run osa:stop` 停止，`npm run osa:status` 查看状态。登录、打开 Orca、打开工作台和加载 Router skill 都不会自动启动服务。Supervisor 注册默认也不自启或自动重启；当前两项 LaunchAgent 均禁用。停止服务不等于停止已派发 Executor。
+
+看门狗单独手动启动：先删除 `~/.orca/watchdog/DISABLED`，再在专用终端运行 `bash ~/.orca/watchdog/orca-watchdog-loop.sh`；Ctrl+C 停止。它不随 `osa:start` 启动。当前保留 DISABLED 标记，且 LaunchAgent 已移除 WatchPaths、RunAtLoad 和 KeepAlive 自动触发。
 
 执行者的报告在线直接提交；服务不可连接时可进入 Orca 原有信箱。报告已排队不等于领域接受；服务保存回执后确认。原生完成、业务完成、输入投递与读取是不同事实。
 

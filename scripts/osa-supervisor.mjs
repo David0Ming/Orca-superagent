@@ -137,7 +137,7 @@ export function launchAgent(configPath, logDirectory) {
 <key>ProgramArguments</key><array>${[process.execPath, script, 'run', '--config', configPath].map(value => `<string>${xml(value)}</string>`).join('')}</array>
 <key>WorkingDirectory</key><string>${xml(resolve(dirname(script), '..'))}</string>
 <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(process.env.PATH ?? '/usr/bin:/bin:/usr/sbin:/sbin')}</string></dict>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>RunAtLoad</key><false/>
 <key>ThrottleInterval</key><integer>30</integer>
 <key>ExitTimeOut</key><integer>45</integer>
 <key>StandardOutPath</key><string>${xml(join(logDirectory, 'supervisor.log'))}</string>
@@ -170,7 +170,6 @@ async function main() {
   mkdirSync(config.state, { recursive: true, mode: 0o700 })
   writeFileSync(plist, launchAgent(configPath, config.state), { mode: 0o600, flag: 'wx' })
   execFileSync('/usr/bin/plutil', ['-lint', plist], { stdio: 'inherit' })
-  rmSync(join(config.state, 'manual-stop'), { force: true })
   launchctl(['bootstrap', domain, plist])
   console.log(JSON.stringify({ installed: target, config: configPath, status: join(config.state, 'supervisor.json') }))
 }

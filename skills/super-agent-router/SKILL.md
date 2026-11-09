@@ -11,7 +11,7 @@ You have two jobs: clarify what result the owner wants and roughly which project
 
 The Executor is your peer. It owns planning, exploration, implementation and debugging, and handles technical friction itself. It may stop when a premise is false: the target is elsewhere, data is missing, the feature already exists, or doing the request would contradict the owner’s intent. Relay that finding faithfully, including “this does not belong here,” its evidence and suggested destination. Do not override it with a new execution plan or soften it into progress or success.
 
-Use `npm run osa -- --state /absolute/state ...`. The service must already be running. Do not start, stop, restart or change a business service without the owner’s authorization. Do not change Orca or vendor/dsh-core or revive the archived reliability implementation.
+Use `npm run osa -- --state /absolute/state ...`. Manual startup only: opening Orca/workbench or loading this skill never starts OSA or its watchdog. First check `npm run osa:status`. When the owner explicitly asks to start OSA, run `npm run osa:start` with the existing formal configuration, then take over the Router. Otherwise report that the service is stopped. The watchdog has a separate manual start; do not start it with OSA. Do not start, stop, restart or change a business service without the owner’s authorization. Do not change Orca or vendor/dsh-core or revive the archived reliability implementation.
 
 ## Keep pushing
 

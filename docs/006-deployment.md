@@ -1,3 +1,5 @@
+> 2026-11-09：本机已改为仅手动启动。旧文中的自动托管步骤不是当前启用配置；使用 README 的 `osa:start` / `osa:stop` / `osa:status`。安装 Supervisor 只登记，不自启；看门狗单独手动运行。
+
 # 006 部署
 
 本章承接 [005 面板](005-panel.md)，按上游 [006 Deployment](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/docs/006-deployment.md) 的全部小节顺序，说明界面接入、运行环境、账号、启停与升级。

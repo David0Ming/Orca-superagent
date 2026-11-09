@@ -1,3 +1,4 @@
+import { launchAgent } from '../scripts/osa-supervisor.mjs'
 import { afterEach, expect, test } from 'vitest'
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -162,3 +163,10 @@ process.on('SIGTERM',()=>{clearTimeout(ready);clearInterval(timer);process.exit(
   expect(first.status).toBe('starting')
   await eventually(async () => (await f.call('status')).status === 'running', 5000)
 }, 25000)
+
+
+test('registered supervisor has no automatic startup or restart triggers', () => {
+  const xml=launchAgent('/tmp/config.json','/tmp/log')
+  expect(xml).toContain('<key>RunAtLoad</key><false/>')
+  for (const trigger of ['KeepAlive','WatchPaths','QueueDirectories','StartInterval','StartCalendarInterval']) expect(xml).not.toContain(`<key>${trigger}</key>`)
+})
