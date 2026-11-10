@@ -33,9 +33,9 @@ OSA = DeepSeek dsh-superagent-prototype 的思想 + Orca 做调度和面板。�
 ## 六、已放弃的路线（2026-11-04）
 
 以下内容已整体回退，不得恢复：可靠性实施线，包括托管运行和代际围栏、原生输入流留存、执行者凭证、受管报告接口、控制序列和停止投递、自动接续、外部效果追踪，以及隔离 Orca 副本 `.osa/implementation-20261104/orca` 中的全部改动。
-`docs/architecture-*-2026110[34].md` 只作为历史记录，不是待实施方案。存档在 `.osa/archive-reliability-20261104/`；源码已恢复到 `.osa/implementation-20261104/osa-before.tar.gz` 快照，只额外保留了调用 Orca 编排命令时加 `--full` 的修复。
+相关历史文档和存档已于 2026-11-10 清理，打包在仓库外 `~/osa-history-20261110.tar.gz`（含当年架构文档以外的 `.osa` 历史目录；文档本身可从 git 历史找回）。源码已恢复到旧快照，只额外保留了调用 Orca 编排命令时加 `--full` 的修复。
 
 当前待办（按顺序）：
-1. 恢复后，旧的初次启动作业重放，不得覆盖已指向新 Dispatch 的 binding（`src/orca.ts` 的 `launch`，见 `docs/architecture-followup-20261103.md`）。
-2. OSA 服务中断时报告不丢：执行者通过 Orca 原有信箱交报告，OSA 在自己的库里记回执后再确认（实验依据见 `docs/architecture-native-experiments-20261103.md` 第 3 节），不改 Orca。
+1. 恢复后，旧的初次启动作业重放，不得覆盖已指向新 Dispatch 的 binding（`src/orca.ts` 的 `launch`，原文档见 git 历史 `docs/architecture-followup-20261103.md`）。
+2. OSA 服务中断时报告不丢：执行者通过 Orca 原有信箱交报告，OSA 在自己的库里记回执后再确认（实验依据见 git 历史 `docs/architecture-native-experiments-20261103.md` 第 3 节），不改 Orca。
 3. 按第一节修改 `skills/super-agent-router/SKILL.md` 与派发逻辑。
