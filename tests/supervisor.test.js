@@ -24,7 +24,8 @@ test('config requires exact paths and cannot override the managed state', () => 
 test('LaunchAgent uses native supervision and escapes paths without shell interpolation', () => {
   const xml = launchAgent('/tmp/a & <b> "config".json', '/tmp/log space')
   expect(xml).toContain('/tmp/a &amp; &lt;b&gt; &quot;config&quot;.json')
-  expect(xml).toContain('<key>KeepAlive</key><true/>')
+  expect(xml).toContain('<key>RunAtLoad</key><false/>')
+  expect(xml).not.toContain('<key>KeepAlive</key>')
   expect(xml).toContain('<key>ThrottleInterval</key><integer>30</integer>')
   expect(xml).toContain('<key>ProgramArguments</key>')
   expect(xml).not.toContain('/bin/sh')

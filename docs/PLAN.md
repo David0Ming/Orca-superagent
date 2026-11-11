@@ -51,7 +51,7 @@
 
 ```
 任意 Agent 窗口
-  1. 加载 super-agent-router 技能（声明身份 + 职责边界）
+  1. 加载 osa-router 技能（声明身份 + 职责边界）
   2. osa router attach        → 领取 Router 租约（同一时间只能有一个 Router）
   3. osa router wait          → 阻塞，直到有待判断卡片、回报或后续通知
   4. osa route accept|attach|stop|ignore ...   → 做决定

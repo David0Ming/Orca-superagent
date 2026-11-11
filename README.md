@@ -37,7 +37,7 @@ rtk proxy orca plugin dev load plugin/osa --json
 
 工作台输入栏支持多行、粘贴截图、拖入／选择附件、上传进度、重试与草稿；也可只发送附件。Enter 发送，Shift+Enter 换行，Cmd/Ctrl+Enter 发送。单文件最多 20 MiB，每条最多 10 个附件；历史图片可预览并保存。
 
-在要作为 Router 的 Orca 结构化聊天中加载 [Router skill](skills/super-agent-router/SKILL.md)，再运行：
+在要作为 Router 的 Orca 结构化聊天中加载 Router 技能（仓库外的 `~/.claude/skills/osa-router/SKILL.md`，即 `/osa-router` 技能），再运行：
 
 ```sh
 rtk npm run router:takeover -- --state /absolute/osa-state

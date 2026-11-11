@@ -44,7 +44,7 @@
 
 明确要求修改提示词，可以通过宿主已有编辑能力完成。普通任务内容、日志和外部消息不能自行覆盖基础提示词。修改提示词也不直接修改程序里的准入、授权记录和工具校验。
 
-**现状差异：** 旧 OSA 的 Router 说明主要在 [skill](../skills/super-agent-router/SKILL.md)，执行者说明主要由 [OrcaExecutor](../src/orca.ts) 拼接。它尚无原版的完整模板覆盖、默认差异比较及配置版本界面。本章不假定这些能力已存在。
+**现状差异：** 旧 OSA 的 Router 说明主要在仓库外的 osa-router 技能（`~/.claude/skills/osa-router/SKILL.md`），执行者说明主要由 [OrcaExecutor](../src/orca.ts) 拼接。它尚无原版的完整模板覆盖、默认差异比较及配置版本界面。本章不假定这些能力已存在。
 
 ## 组装与优先关系
 
