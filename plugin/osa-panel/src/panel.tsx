@@ -1,5 +1,5 @@
 import { atom, read, set, plugin, Stack, Row, Text, Button, IconButton, Box, Separator, RelativeTime, List, ListItem, Callout, Skeleton, Input, Select, CodeView, Image, env, type Tone, type PanelContext } from 'orca'
-import { COMPLETED_STATUSES, isActionableMessage, belongsToTask, isLiveRun } from './protocol'
+import { COMPLETED_STATUSES, isActionableMessage, belongsToTask, isLiveRun, waitingCondition } from './protocol'
 import type { Action, Detail, MessageView, RunView, Section, Selection, Snapshot, TaskView, WorkerView } from './protocol'
 
 const snapshot = atom<Snapshot | null>('last-snapshot', null, { persist: 'workspace' })
@@ -30,8 +30,8 @@ let searchTimer: ReturnType<typeof setTimeout> | undefined
 
 const DONE = COMPLETED_STATUSES
 const SECTIONS: { id: Section; name: string; tone: 'danger' | 'warning' | 'accent'; icon: 'bell' | 'flag' | 'activity' | 'pause' }[] = [
-  { id: 'attention', name: '阻塞', tone: 'danger', icon: 'bell' },
-  { id: 'queued', name: '待开始', tone: 'warning', icon: 'flag' },
+  { id: 'attention', name: '需要你', tone: 'danger', icon: 'bell' },
+  { id: 'queued', name: '待开始·等条件', tone: 'warning', icon: 'flag' },
   { id: 'active', name: '进行中', tone: 'accent', icon: 'activity' },
   { id: 'history', name: '历史', tone: 'accent', icon: 'activity' },
 ]
@@ -47,16 +47,16 @@ export function rows(data: Snapshot): Item[] {
     for (const task of run.tasks) {
       if (DONE.has(task.status)) continue
       const worker = run.workers.find(w => w.dispatchId === task.dispatchId) || run.workers.find(w => w.taskId === task.id)
-      const section: Section = task.status === 'blocked' || (task.status === 'failed' && live) ? 'attention'
-        : ['pending', 'ready'].includes(task.status) ? 'queued'
-        : task.status !== 'failed' && (task.status === 'dispatched' || worker?.liveness === 'live') ? 'active' : 'history'
+      const section: Section = ['pending', 'ready', 'blocked'].includes(task.status) ? 'queued'
+        : task.status === 'failed' ? live ? 'attention' : 'history'
+        : task.status === 'dispatched' || worker?.liveness === 'live' ? 'active' : 'history'
       const workspace = data.workspaces.find(w => w.id === worker?.workspace)
       const runWorkspace = data.workspaces.find(w => run.workers.some(worker => worker.workspace === w.id))
       const messages = run.messages.filter(message => belongsToTask(message, task, worker))
       items.push({ key: `${run.runId}:${task.id}`, runId: run.runId, taskId: task.id, dispatchId: worker?.dispatchId,
         run, task, worker, messages, title: task.title, preview: task.resultTitle || (task.dependencies?.length ? `等待：${task.dependencies.join('、')}` : '') || task.result || messages[0]?.body || task.spec,
         summary: task.status === 'failed' ? `失败${task.resultTitle || task.result ? ` · ${task.resultTitle || task.result}` : ' · 任务记录标记失败'}`
-          : task.status === 'blocked' ? `阻塞 · ${task.dependencies?.length ? `等待：${task.dependencies.join('、')}` : '任务记录标记阻塞'}`
+          : task.status === 'blocked' ? task.waitingCondition || waitingCondition(task)
           : task.status === 'pending' ? '待开始 · 尚未派发' : task.status === 'ready' ? '就绪 · 等待派发'
           : worker?.liveness === 'live' ? (worker.activity === 'working' ? '正在执行' : worker.activity === 'waiting' ? '窗口等待输入' : '执行窗口在线')
           : section === 'history' ? `任务状态：${task.status}` : '已派发 · 运行情况待确认',
@@ -65,15 +65,15 @@ export function rows(data: Snapshot): Item[] {
         project: workspace?.project || runWorkspace?.project || run.project,
         updatedAt: task.updatedAt })
     }
-    const historicalQuestions = !live ? run.messages.filter(message => !message.unread && isActionableMessage(message, run)) : []
+    const historicalQuestions = !live ? run.messages.filter(message => isActionableMessage(message, run)) : []
     if (!live && (run.tasks.every(task => DONE.has(task.status)) || historicalQuestions.length > 0)) {
       const worker = run.workers[0]
       const workspace = data.workspaces.find(w => w.id === worker?.workspace)
       items.push({ key: `${run.runId}:history`, runId: run.runId, dispatchId: worker?.dispatchId, run, worker, messages: run.messages, title: run.name,
-        preview: run.objective, status: '已结束', summary: historicalQuestions.length ? `${historicalQuestions.length} 条已读未回复消息 · Run 已结束` : '无在线执行者或活动任务', section: 'history',
+        preview: run.objective, status: '已结束', summary: historicalQuestions.length ? `${historicalQuestions.length} 条待处理消息 · Run 已结束` : '无在线执行者或活动任务', section: 'history',
         agent: worker?.agent || '', workspace: worker?.workspace || '', workspaceName: workspace?.name || '', project: workspace?.project || run.project, updatedAt: run.updatedAt })
     }
-    const pendingMessages = run.messages.filter(m => isActionableMessage(m, run) && (live || m.unread))
+    const pendingMessages = run.messages.filter(m => live && isActionableMessage(m, run))
       .sort((a, b) => (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0))
     const message = pendingMessages[0]
     if (message) {
@@ -291,7 +291,6 @@ export default function Panel() {
     {read(error) && <Callout tone="danger">{read(error)}</Callout>}
     {read(filtersOpen) && data?.warnings.map(warning => <Callout key={warning} tone="warning">{warning}</Callout>)}
     {read(result) && <Box padding="sm" gap="xs"><Text size="xs">{read(result)}</Text>{read(receipt) && <CodeView code={read(receipt)} wrap maxHeight="sm" />}</Box>}
-    {data && read(busy) && <Box paddingX="sm"><Text size="xs" muted>显示上次快照，正在刷新…</Text></Box>}
     {!data && <Skeleton />}
     {data && !filtered.length && <Box padding="sm"><Text size="sm" muted>当前范围没有匹配的会话。</Text></Box>}
     {SECTIONS.map(section => {

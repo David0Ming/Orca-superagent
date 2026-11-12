@@ -28,7 +28,20 @@ export interface WorkerView {
 }
 export interface TaskView {
   id: string; title: string; status: string; spec: string; result: string; resultTitle?: string; resultSource?: string; dependencies?: string[]
-  updatedAt: string; dispatchId: string; assignee: string; searchMatch?: string
+  updatedAt: string; dispatchId: string; assignee: string; searchMatch?: string; waitingCondition?: string
+}
+export function waitingCondition(task: Pick<TaskView, 'resultTitle' | 'result' | 'spec' | 'dependencies'>) {
+  if (task.dependencies?.length) return `等待：${task.dependencies.join('、')}`
+  for (const text of [task.resultTitle, task.result, task.spec]) {
+    for (const clause of (text || '').split(/[。；;\n]/)) {
+      if (/(?:不|无需|无须|不用|不要)\s*(?:等待|等|待|依赖)/.test(clause) || /^\s*(?:若|如果|假如|如需|当.+?时)/.test(clause)) continue
+      const match = clause.match(/((?:等待|依赖)[^。；;\n]{1,80})/)
+        || clause.match(/(?:^|[：:，,])\s*((?:等|待)[^。；;\n]{1,80})/)
+        || clause.match(/【前置[^】]*】\s*(.+)/)
+      if (match) return match[1].trim()
+    }
+  }
+  return '等待条件未注明'
 }
 export interface RunView {
   name: string; runId: string; objective: string; project: string; handle: string

@@ -213,17 +213,22 @@ test('detail only includes messages belonging to this task despite a reused term
 })
 
 
-test('native read is not a reply; only reverse-addressed direct-thread replies resolve questions', async () => {
+test('any later reverse-addressed same-thread message answers a question regardless of subject or type', async () => {
   const { call } = fixture()
-  const question = { id: 'question', run_id: 'run_one', from_handle: 'term_one', to_handle: 'run:run_one', subject: '决定', body: '是否继续', type: 'question', read: true, delivered_at: '2026-11-11 03:00:00', created_at: '2026-11-11 03:00:00', thread_id: 'question' }
-  const response = { ...question, id: 'response', from_handle: 'run:run_one', to_handle: 'term_one', type: 'status', subject: 'Re: 决定', created_at: '2026-11-11 04:00:00' }
-  for (const reply of [undefined, { ...response, subject: '同线程状态' }, { ...response, from_handle: 'term_other' }, { ...response, thread_id: 'other_question' }, response]) {
+  const question = { id: 'question', run_id: 'run_one', from_handle: 'term_one', to_handle: 'run:run_one', subject: '决定', body: '是否继续', type: 'question', read: true, delivered_at: '2026-11-11 03:00:00', created_at: '2026-11-11 03:00:00', thread_id: 'thread_root' }
+  const response = { ...question, id: 'response', from_handle: 'run:run_one', to_handle: 'term_one', type: 'info', subject: '按计划继续', created_at: '2026-11-11 04:00:00' }
+  for (const [reply, replied] of [
+    [undefined, false], [response, true], [{ ...response, type: 'escalation', subject: '另一主题' }, true],
+    [{ ...response, created_at: '2026-11-11 02:00:00' }, false], [{ ...response, created_at: question.created_at }, false],
+    [{ ...response, from_handle: question.from_handle, to_handle: question.to_handle }, false],
+    [{ ...response, thread_id: 'other_thread' }, false],
+  ] as const) {
     const data = await collect(20, async args => args[1] === 'inbox' ? { messages: [question, ...(reply ? [reply] : [])] } : call(args))
     const message = data.runs[0].messages.find(message => message.id === 'question')!
     assert.equal(message.unread, false)
     assert.equal(message.deliveredAt, '2026-11-11T03:00:00Z')
-    assert.equal(message.replied, reply === response)
-    assert.equal(data.runs[0].actionableMessageCount, reply === response ? 0 : 1)
+    assert.equal(message.replied, replied)
+    assert.equal(data.runs[0].actionableMessageCount, replied ? 0 : 1)
   }
 })
 
@@ -268,4 +273,13 @@ test('native Router and dispatch aliases verify a reply without accepting anothe
     ] } : call(args))
     assert.equal(data.runs[0].messages.find(message => message.id === 'question')?.replied, destination === 'dispatch:ctx_one')
   }
+})
+
+
+test('blocked waiting evidence is captured before the list truncates task text', async () => {
+  const { call } = fixture()
+  const data = await collect(20, async args => args[1] === 'task-list' ? { tasks: [{ id: 'task_one', status: 'blocked', dispatch_id: 'ctx_one', spec: '背景资料'.repeat(100) + '\n等待生产窗口。' }] } : call(args))
+  assert.equal(data.runs[0].tasks[0].spec.length, 300)
+  assert.equal(data.runs[0].tasks[0].waitingCondition, '等待生产窗口')
+  assert.equal(data.runs[0].activeTaskCount, 0)
 })

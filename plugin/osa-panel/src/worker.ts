@@ -5,8 +5,8 @@ import { join, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { promisify } from 'node:util'
 import type { OrcaWorkerApi } from 'orca/worker'
-import { ACTIVE_TASK_STATUSES, COMPLETED_STATUSES, isActionableMessage, belongsToTask } from './protocol'
-import type { Action, ActionResult, Detail, MessageView, RunView, Selection, Snapshot, WorkerView } from './protocol'
+import { ACTIVE_TASK_STATUSES, COMPLETED_STATUSES, isActionableMessage, belongsToTask, waitingCondition } from './protocol'
+import type { Action, ActionResult, Detail, MessageView, RunView, Selection, Snapshot, TaskView, WorkerView } from './protocol'
 
 const exec = promisify(execFile)
 const CLI = process.env.ORCA_CLI_COMMAND || 'orca'
@@ -76,12 +76,11 @@ async function readRun(run: any, inbox: any[], call: Cli, environments = names()
   const rawMessages = inbox.filter(message => message.run_id === run.id)
   const messages: MessageView[] = rawMessages.map(message => {
     const payload = json(message.payload)
-    // Native replies are reverse-addressed status messages whose thread points at the question.
-    const replied = rawMessages.some(reply => reply.id !== message.id && reply.thread_id === message.id
+    // A later reverse-addressed message on the same native thread is a reply.
+    const replied = rawMessages.some(reply => reply.id !== message.id && reply.thread_id === (message.thread_id || message.id)
       && (reply.from_handle === message.to_handle || (message.to_handle === `run:${run.id}` && !!run.coordinator_handle && reply.from_handle === run.coordinator_handle))
       && (reply.to_handle === message.from_handle || (!!payload.dispatchId && reply.to_handle === `dispatch:${payload.dispatchId}`))
-      && reply.type === 'status' && reply.subject === `Re: ${message.subject}`
-      && Date.parse(time(reply.created_at)) >= Date.parse(time(message.created_at)))
+      && Date.parse(time(reply.created_at)) > Date.parse(time(message.created_at)))
     return { id: message.id, from: message.from_handle || '', to: message.to_handle || '', subject: message.subject || '', body: message.body || '',
       type: message.type || '', createdAt: time(message.created_at), unread: !message.read,
       threadId: message.thread_id || '', deliveredAt: time(message.delivered_at), replied, source: payload.source || '',
@@ -102,13 +101,14 @@ async function readRun(run: any, inbox: any[], call: Cli, environments = names()
     tasks: rawTasks.map((task: any) => {
       const result = json(task.result)
       const worker = workers.find(worker => worker.dispatchId === (task.dispatch_id || task.dispatchId)) || workers.find(worker => worker.taskId === task.id)
-      const view = { id: task.id, title: task.task_title || task.title || task.display_name || '待命名任务', status: task.status || 'unknown',
+      const view: TaskView = { id: task.id, title: task.task_title || task.title || task.display_name || '待命名任务', status: task.status || 'unknown',
         spec: task.spec || '', resultTitle: result.subject || '', resultSource: result.provenance || '',
         dependencies: (Array.isArray(json(task.deps)) ? json(task.deps) : []).map((id: string) => { const dependency = rawTasks.find(task => task.id === id); return dependency && !COMPLETED_STATUSES.has(dependency.status) ? dependency.task_title || dependency.display_name || id : '' }).filter(Boolean),
         result: result.body || result.subject || (typeof task.result === 'string' ? task.result : ''), updatedAt: '',
         dispatchId: task.dispatch_id || task.dispatchId || worker?.dispatchId || '', assignee: task.assignee_handle || task.assignee || '' }
       const candidates = [time(task.completed_at), times.get(task.id) || '', ...messages.filter(message => belongsToTask(message, view, worker)).map(message => message.createdAt)].filter(value => Number.isFinite(Date.parse(value)))
       view.updatedAt = time(task.updated_at) || candidates.sort((a, b) => Date.parse(b) - Date.parse(a))[0] || ''
+      if (view.status === 'blocked') view.waitingCondition = waitingCondition(view)
       return view
     }), messages,
   }

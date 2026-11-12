@@ -17,7 +17,7 @@ const data: Snapshot = { runs: [run, { ...run, runId: 'run_two', name: 'Run Two'
 test('exact task enum wins over live workers; completed stays hidden', () => {
   const rows = main.rows(data)
   assert.deepEqual(rows.filter(row => row.runId === 'run_one').map(row => [row.taskId || 'message', row.section]), [
-    ['pending', 'queued'], ['ready', 'queued'], ['blocked', 'attention'], ['dispatched', 'active'], ['failed', 'attention'], ['message', 'attention'],
+    ['pending', 'queued'], ['ready', 'queued'], ['blocked', 'queued'], ['dispatched', 'active'], ['failed', 'attention'], ['message', 'attention'],
   ])
 })
 
@@ -32,7 +32,7 @@ test('scope, search, filters, grouping, folding and read-only title details', as
     assert.deepEqual(panel.errors, [])
     assert.deepEqual(panel.warnings, [])
     assert.ok(panel.find({ type: 'Text', text: '任务清单' }))
-    assert.ok(panel.find({ type: 'Text', text: '待开始' }))
+    assert.ok(panel.find({ type: 'Text', text: '待开始·等条件' }))
     assert.equal(panel.find({ type: 'Text', text: '待开始·阻塞' }), null)
     assert.equal(panel.findAll({ type: 'ListItem', label: 'dispatched task' }).length, 2)
     assert.ok(panel.findAll({ type: 'ListItem', label: 'dispatched task' }).every(row => !row.props.icon))
@@ -97,7 +97,7 @@ test('one latest unread question row per Run; queued and completed win over live
   assert.equal(messages[0].title, '有消息待回')
   assert.equal(messages[0].summary, '未读待回复 · 最新问题')
   assert.equal(messages[0].updatedAt, '2026-11-11T02:00:00Z')
-  assert.deepEqual(rows.filter(r => r.taskId === 'blocked').map(r => r.section), ['attention'])
+  assert.deepEqual(rows.filter(r => r.taskId === 'blocked').map(r => r.section), ['queued'])
   assert.equal(rows.some(r => ['completed', 'succeeded', 'success', 'done'].includes(r.taskId || '')), false)
   assert.equal(rows.find(r => r.taskId === 'other')?.section, 'active')
 })
@@ -110,8 +110,8 @@ test('history uses raw counts and stays collapsed; empty sections have no headin
   try {
     assert.ok(panel.find({ type: 'Button', text: '历史' }))
     assert.equal(panel.find({ type: 'ListItem', label: '历史工作' }), null)
-    assert.equal(panel.find({ type: 'Text', text: '阻塞' }), null)
-    assert.equal(panel.find({ type: 'Text', text: '待开始' }), null)
+    assert.equal(panel.find({ type: 'Text', text: '需要你' }), null)
+    assert.equal(panel.find({ type: 'Text', text: '待开始·等条件' }), null)
     assert.equal(panel.find({ type: 'Text', text: '进行中' }), null)
     await panel.press({ type: 'Button', text: '历史' })
     assert.ok(panel.find({ type: 'ListItem', label: '历史工作' }))
@@ -121,18 +121,18 @@ test('history uses raw counts and stays collapsed; empty sections have no headin
   } finally { await panel.unmount() }
 })
 
-test('blocked always needs owner attention; failed only does in a live Run', () => {
+test('waiting tasks always queue; failed tickets need attention only in a live Run', () => {
   const base: RunView = { ...run, workers: [], messages: [] }
   for (const status of ['failed', 'blocked']) {
     const dead = main.rows({ ...data, runs: [{ ...base, tasks: [task(status)] }] })
-    assert.deepEqual(dead.map(r => r.section), [status === 'blocked' ? 'attention' : 'history'])
+    assert.deepEqual(dead.map(r => r.section), [status === 'blocked' ? 'queued' : 'history'])
     assert.equal(dead[0].taskId, status)
     const pending = main.rows({ ...data, runs: [{ ...base, tasks: [task(status), task('pending')] }] })
-    assert.deepEqual(pending.map(r => r.section), ['attention', 'queued'])
+    assert.deepEqual(pending.map(r => r.section), [status === 'blocked' ? 'queued' : 'attention', 'queued'])
     const unread = main.rows({ ...data, runs: [{ ...base, tasks: [task(status)], messages: run.messages }] })
-    assert.deepEqual(unread.map(r => r.section), [status === 'blocked' ? 'attention' : 'history', 'attention'])
+    assert.deepEqual(unread.map(r => r.section), [status === 'blocked' ? 'queued' : 'history', 'history'])
     const live = main.rows({ ...data, runs: [{ ...base, tasks: [task(status)], workers: [run.workers[0]] }] })
-    assert.deepEqual(live.map(r => r.section), ['attention'])
+    assert.deepEqual(live.map(r => r.section), [status === 'blocked' ? 'queued' : 'attention'])
   }
 })
 
@@ -156,24 +156,24 @@ test('remount draws persisted rows before a slow list refresh completes', async 
   } finally { await panel.unmount() }
 })
 
-test('dead mixed tickets split attention/history and all other non-active tickets remain in history', () => {
+test('dead blocked tickets queue while failed tickets stay historical', () => {
   const base: RunView = { ...run, workers: [], messages: [], tasks: [task('blocked'), task('failed'), task('other')] }
   const dead = main.rows({ ...data, runs: [base] })
-  assert.deepEqual(dead.map(row => [row.taskId, row.section]), [['blocked', 'attention'], ['failed', 'history'], ['other', 'history']])
+  assert.deepEqual(dead.map(row => [row.taskId, row.section]), [['blocked', 'queued'], ['failed', 'history'], ['other', 'history']])
   const live = main.rows({ ...data, runs: [{ ...base, workers: [{ ...run.workers[0], taskId: 'other', dispatchId: 'ctx_other' }] }] })
-  assert.deepEqual(live.map(row => [row.taskId, row.section]), [['blocked', 'attention'], ['failed', 'attention'], ['other', 'active']])
+  assert.deepEqual(live.map(row => [row.taskId, row.section]), [['blocked', 'queued'], ['failed', 'attention'], ['other', 'active']])
   const unrelatedLive = main.rows({ ...data, runs: [{ ...base, tasks: [task('pending'), task('other')] }] })
   assert.deepEqual(unrelatedLive.map(row => [row.taskId, row.section]), [['pending', 'queued'], ['other', 'history']])
 })
 
-test('system receipts never create attention or keep failed Runs live; blocked remains actionable', () => {
+test('system receipts never create attention or keep failed Runs live; blocked remains queued', () => {
   const receipts = ['DiD nOt ReAcH', 'REACH THE FINISHED WORKER', 'Worker STOPPED without REPORTING', 'waiting ON a PROMPT']
   for (const type of ['question', 'escalation']) {
     for (const phrase of receipts) for (const field of ['subject', 'body']) {
       const message = { ...run.messages[0], type, subject: '需要决定', body: '真实内容', [field]: phrase }
       assert.equal(isActionableMessage(message, run), false)
       const rows = main.rows({ ...data, runs: [{ ...run, tasks: [task('failed'), task('blocked')], workers: [], messages: [message] }] })
-      assert.deepEqual(rows.map(row => [row.taskId, row.section]), [['failed', 'history'], ['blocked', 'attention']])
+      assert.deepEqual(rows.map(row => [row.taskId, row.section]), [['failed', 'history'], ['blocked', 'queued']])
     }
     assert.equal(isActionableMessage({ ...run.messages[0], type, id: 'msg_stop_test' }, run), false)
     assert.equal(isActionableMessage({ ...run.messages[0], type }, run), true)
@@ -284,9 +284,9 @@ test('only workers and pending/ready/dispatched tasks keep Runs live; old read q
   const answered = { ...live, messages: [{ ...message, replied: true }] }
   assert.equal(main.rows({ ...data, runs: [answered] }).filter(row => !row.taskId).length, 0)
   const unread = { ...dead, messages: [{ ...message, unread: true }] }
-  assert.deepEqual(main.rows({ ...data, runs: [unread] }).map(row => row.section), ['history', 'attention'])
+  assert.deepEqual(main.rows({ ...data, runs: [unread] }).map(row => row.section), ['history', 'history'])
   const blocked = { ...dead, tasks: [task('blocked')] }
-  assert.equal(main.rows({ ...data, runs: [blocked] })[0].section, 'attention')
+  assert.equal(main.rows({ ...data, runs: [blocked] })[0].section, 'queued')
   for (const own of [{ ...message, source: 'osa-panel' }, { ...message, from: 'run:run_one' }, { ...message, type: 'status', subject: 'queue-scan' }]) {
     assert.equal(isActionableMessage(own, live), false)
   }
@@ -306,4 +306,23 @@ test('completed totals include only active Runs, follow actual assignment and ap
   try {
     assert.equal(panel.findAll({ type: 'Text', text: '已完成 1' }).length, 1)
   } finally { await panel.unmount() }
+})
+
+
+test('blocked summaries use explicit waiting evidence, never infer conditions from the task goal', () => {
+  const summary = (evidence: Partial<TaskView>) => main.rows({ ...data, runs: [{ ...run, tasks: [{ ...task('blocked'), ...evidence }], messages: [] }] })[0].summary
+  assert.equal(summary({ resultTitle: '等生产窗口' }), '等生产窗口')
+  assert.equal(summary({ result: '当前阻塞：等待制品通过验收。其他信息。' }), '等待制品通过验收')
+  assert.equal(summary({ spec: '【前置（唯一长板）】V2 Worker 制品必须构建出来。' }), 'V2 Worker 制品必须构建出来')
+  assert.equal(summary({ dependencies: ['镜像构建'] }), '等待：镜像构建')
+  assert.equal(summary({ spec: '恢复自动回复。不等待审批直接做。若等待制品则暂缓。' }), '等待条件未注明')
+  assert.equal(summary({ spec: '只准备方案，不执行生产切换。' }), '等待条件未注明')
+})
+
+
+test('three blocked tickets in a dead Run stay queued without a duplicate historical summary', () => {
+  const current = { ...run, workers: [], messages: [], tasks: [1, 2, 3].map(id => ({ ...task('blocked'), id: `blocked_${id}`, title: `Wave2 ${id}` })) }
+  const rows = main.rows({ ...data, runs: [current] })
+  assert.equal(rows.length, 3)
+  assert.ok(rows.every(row => row.section === 'queued'))
 })
