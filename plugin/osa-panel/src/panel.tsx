@@ -1,8 +1,11 @@
-import { atom, read, set, plugin, Stack, Row, Text, Button, IconButton, Box, Separator, RelativeTime, List, ListItem, Callout, Skeleton, Input, Select, CodeView, Image, env, type Tone, type PanelContext } from 'orca'
-import { COMPLETED_STATUSES, isActionableMessage, belongsToTask, isLiveRun, waitingCondition } from './protocol'
+import { atom, derived, read, set, plugin, Stack, Row, Text, Button, IconButton, Box, Separator, RelativeTime, List, ListItem, Callout, Skeleton, Input, Select, CodeView, Image, env, type Tone, type PanelContext } from 'orca'
+import { COMPLETED_STATUSES, isActionableMessage, belongsToTask, isLiveRun, blockedQuestion, isSystemReceipt } from './protocol'
 import type { Action, Detail, MessageView, RunView, Section, Selection, Snapshot, TaskView, WorkerView } from './protocol'
 
-const snapshot = atom<Snapshot | null>('last-snapshot', null, { persist: 'workspace' })
+const CACHE_VERSION = 3
+const cachedSnapshot = atom<Snapshot | null>('last-snapshot', null, { persist: 'workspace', version: CACHE_VERSION, migrate: () => null })
+const freshSnapshot = atom<Snapshot | null>(null)
+const snapshot = derived(() => read(freshSnapshot) || read(cachedSnapshot))
 const error = atom('')
 const busy = atom(false)
 const limit = atom(20)
@@ -13,8 +16,6 @@ const query = atom('')
 const agentFilter = atom('all')
 const stateFilter = atom('all')
 const grouping = atom('project')
-const routerHandle = atom('')
-const mentionTarget = atom<string | null>(null)
 const sort = atom('newest')
 const filtersOpen = atom(false)
 const collapsed = atom<string[]>([])
@@ -27,13 +28,15 @@ const result = atom('')
 const receipt = atom('')
 const mentionTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let searchTimer: ReturnType<typeof setTimeout> | undefined
-
+let visibilityContext: PanelContext | undefined
+let wasVisible = false
 const DONE = COMPLETED_STATUSES
-const SECTIONS: { id: Section; name: string; tone: 'danger' | 'warning' | 'accent'; icon: 'bell' | 'flag' | 'activity' | 'pause' }[] = [
+const SECTIONS: { id: Section; name: string; tone: 'danger' | 'warning' | 'accent' | 'success' | 'neutral'; icon: 'bell' | 'flag' | 'activity' | 'pause' }[] = [
   { id: 'attention', name: '需要你', tone: 'danger', icon: 'bell' },
-  { id: 'queued', name: '待开始·等条件', tone: 'warning', icon: 'flag' },
+  { id: 'ready', name: '待开始', tone: 'success', icon: 'flag' },
+  { id: 'waiting', name: '等外部事件', tone: 'neutral', icon: 'pause' },
   { id: 'active', name: '进行中', tone: 'accent', icon: 'activity' },
-  { id: 'history', name: '历史', tone: 'accent', icon: 'activity' },
+  { id: 'history', name: '历史', tone: 'neutral', icon: 'activity' },
 ]
 export interface Item extends Selection {
   key: string; title: string; preview: string; status: string; section: Section
@@ -44,10 +47,15 @@ export function rows(data: Snapshot): Item[] {
   const items: Item[] = []
   for (const run of data.runs) {
     const live = isLiveRun(run)
+    const hasLiveWorker = run.workers.some(worker => worker.liveness === 'live')
+    // A Run with no bound Router and no live worker is dormant: keep its tickets out of the working sections.
+    const dormant = run.canReassess === false && !hasLiveWorker
     for (const task of run.tasks) {
       if (DONE.has(task.status)) continue
       const worker = run.workers.find(w => w.dispatchId === task.dispatchId) || run.workers.find(w => w.taskId === task.id)
-      const section: Section = ['pending', 'ready', 'blocked'].includes(task.status) ? 'queued'
+      const section: Section = dormant ? 'history' : task.status === 'blocked' ? 'attention'
+        : task.status === 'ready' ? 'ready'
+        : task.status === 'pending' ? 'waiting'
         : task.status === 'failed' ? live ? 'attention' : 'history'
         : task.status === 'dispatched' || worker?.liveness === 'live' ? 'active' : 'history'
       const workspace = data.workspaces.find(w => w.id === worker?.workspace)
@@ -55,9 +63,10 @@ export function rows(data: Snapshot): Item[] {
       const messages = run.messages.filter(message => belongsToTask(message, task, worker))
       items.push({ key: `${run.runId}:${task.id}`, runId: run.runId, taskId: task.id, dispatchId: worker?.dispatchId,
         run, task, worker, messages, title: task.title, preview: task.resultTitle || (task.dependencies?.length ? `等待：${task.dependencies.join('、')}` : '') || task.result || messages[0]?.body || task.spec,
-        summary: task.status === 'failed' ? `失败${task.resultTitle || task.result ? ` · ${task.resultTitle || task.result}` : ' · 任务记录标记失败'}`
-          : task.status === 'blocked' ? task.waitingCondition || waitingCondition(task)
-          : task.status === 'pending' ? '待开始 · 尚未派发' : task.status === 'ready' ? '就绪 · 等待派发'
+        summary: dormant ? `任务状态：${task.status}`
+          : task.status === 'failed' ? `失败${task.resultTitle || task.result ? ` · ${task.resultTitle || task.result}` : ' · 任务记录标记失败'}`
+          : task.status === 'blocked' ? task.blockedQuestion || blockedQuestion(task)
+          : task.status === 'pending' ? (task.result.slice(0, 120) || '待派发 · 等外部事件') : task.status === 'ready' ? '就绪 · 等待派发'
           : worker?.liveness === 'live' ? (worker.activity === 'working' ? '正在执行' : worker.activity === 'waiting' ? '窗口等待输入' : '执行窗口在线')
           : section === 'history' ? `任务状态：${task.status}` : '已派发 · 运行情况待确认',
         status: task.status, section, agent: worker?.agent || '', workspace: worker?.workspace || '',
@@ -109,14 +118,25 @@ function toggle(state: typeof expanded, key: string) {
   const current = read(state)
   set(state, current.includes(key) ? current.filter(id => id !== key) : [...current, key])
 }
+export function cachePreview(data: Snapshot): Snapshot | null {
+  const preview = { ...data, runs: data.runs.map(run => ({ ...run, objective: run.objective.slice(0, 80),
+    tasks: run.tasks.map(task => ({ ...task, spec: '', result: '', resultTitle: task.resultTitle || task.result.slice(0, 80),
+      ...(task.status === 'blocked' ? { blockedQuestion: task.blockedQuestion || blockedQuestion(task) } : {}) })),
+    messages: run.messages.map(message => ({ ...message, subject: message.subject.slice(0, 120), body: message.body.slice(0, 80), systemReceipt: isSystemReceipt(message) })),
+  })) }
+  // Orca limits each persisted atom to 256 KiB of UTF-8, including its version envelope.
+  return new TextEncoder().encode(JSON.stringify({ version: CACHE_VERSION, value: preview })).length <= 262144 ? preview : null
+}
 async function refresh(force = false) {
   if (read(busy)) return
   set(busy, true)
   const searched = read(query)
   try {
     const next = await plugin.request('osa-tasks.list', { limit: read(limit), query: searched, force }, { timeoutMs: 60000 })
-    set(snapshot, next)
-    set(error, '')
+    set(freshSnapshot, next)
+    const preview = cachePreview(next)
+    set(cachedSnapshot, preview)
+    set(error, preview ? '' : '列表已更新；快照超过 Orca 256 KiB 缓存上限，本次不保留缓存。')
   } catch (e) { set(error, String(e)) }
   finally {
     set(busy, false)
@@ -124,9 +144,11 @@ async function refresh(force = false) {
   }
 }
 export function setup(ctx: PanelContext) {
-  void refresh()
+  visibilityContext = ctx
+  wasVisible = read(ctx.visible)
+  void refresh(true)
   const timer = setInterval(() => { if (read(ctx.visible)) void refresh(true) }, 15000)
-  ctx.subscriptions.push({ dispose: () => { clearInterval(timer); clearTimeout(searchTimer); for (const timer of mentionTimers.values()) clearTimeout(timer); mentionTimers.clear() } })
+  ctx.subscriptions.push({ dispose: () => { if (visibilityContext === ctx) visibilityContext = undefined; clearInterval(timer); clearTimeout(searchTimer); for (const timer of mentionTimers.values()) clearTimeout(timer); mentionTimers.clear() } })
 }
 async function loadDetail(item: Item, mode: 'latest' | 'history' | 'next' = 'latest') {
   if (read(loadingDetails).includes(item.key)) return
@@ -146,12 +168,14 @@ async function act(item: Item, kind: Action['kind']) {
   set(result, '')
   set(receipt, '')
   try {
-    const response = await plugin.request('osa-tasks.action', { ...selection(item), kind, ...(kind === 'mention' ? { router: read(routerHandle) || item.run.handle } : {}) }, { timeoutMs: 60000 })
+    const response = await plugin.request('osa-tasks.action', { ...selection(item), kind }, { timeoutMs: 60000 })
     set(result, response.message)
     set(receipt, response.receipt || '')
-    if (response.ok && kind === 'mention') set(mentionTarget, null)
   } catch (e) { set(result, `${String(e)}。未自动重试，请先核对投递结果。`) }
   finally { set(sending, false) }
+}
+function RecordText({ text }: { text: string }) {
+  return <Stack gap="xs"><Text size="xs">{text.slice(0, 16000)}</Text>{text.length > 16000 && <Text size="xs" tone="warning">内容超过 16000 字，已截断显示；原始记录未改动。</Text>}</Stack>
 }
 function SessionRow({ item }: { item: Item }) {
   const open = read(expanded).includes(item.key)
@@ -163,8 +187,9 @@ function SessionRow({ item }: { item: Item }) {
   const at = Date.parse(item.updatedAt)
   const agent = item.agent.startsWith('claude') ? 'claude' : item.agent === 'codex' ? 'codex' : ''
   const agentName = agent === 'claude' ? 'Claude' : agent === 'codex' ? 'Codex' : item.agent
-  const tone: Tone = item.section === 'attention' ? 'warning' : item.section === 'queued' ? 'warning' : item.section === 'active' ? 'accent' : 'neutral'
-  const frameTone = item.status === 'ready' ? 'success' : item.status === 'failed' ? 'danger' : item.status === 'blocked' || item.section === 'attention' ? 'warning' : undefined
+  const frameTone = item.status === 'ready' ? 'success' : item.status === 'failed' || item.section === 'attention' && !item.taskId ? 'danger'
+    : item.status === 'blocked' ? 'warning' : item.status === 'pending' ? 'neutral' : item.section === 'active' ? 'accent' : undefined
+  const tone: Tone = frameTone || 'neutral'
   return <Stack gap="none">
     <Box paddingY="xs" gap="xs" background={frameTone || 'none'} border={frameTone || false}>
       <Row gap="none" align="center">
@@ -174,21 +199,15 @@ function SessionRow({ item }: { item: Item }) {
             if (!open && !detail) void loadDetail(item)
           }} /></List>
         </Box>
-        <Button size="xs" variant="ghost" tooltip={`单击引用到 Router，双击定位窗口：${item.title}`} disabled={read(sending)} onPress={() => {
+        <Button size="xs" variant="ghost" tooltip={`单击复制任务引用，粘贴给 Router 询问；双击定位窗口：${item.title}`} disabled={read(sending)} onPress={() => {
           const pending = mentionTimers.get(item.key)
           if (pending) { clearTimeout(pending); mentionTimers.delete(item.key); void act(item, 'open'); return }
           mentionTimers.set(item.key, setTimeout(() => {
             mentionTimers.delete(item.key)
-            if (read(routerHandle) || item.run.handle) void act(item, 'mention')
-            else set(mentionTarget, read(mentionTarget) === item.key ? null : item.key)
+            void act(item, 'mention')
           }, 300))
         }}>@</Button>
       </Row>
-      {read(mentionTarget) === item.key && <Box padding="sm" gap="sm" background="muted">
-        <Text size="xs">这张工单没有可用的 Router 绑定。选择要填入定位的智能体窗口，不会发送。</Text>
-        <Select label="Router 窗口" value={read(routerHandle) || '__choose__'} options={[{ value: '__choose__', label: '选择 Router 窗口' }, ...(read(snapshot)?.routers || []).map(router => ({ value: router.handle, label: `${router.title} · ${router.agent}` }))]} onChange={value => set(routerHandle, value === '__choose__' ? '' : value)} />
-        <Button size="xs" disabled={read(sending) || !read(routerHandle)} onPress={() => void act(item, 'mention')}>填入 Router 输入框</Button>
-      </Box>}
       <Box paddingX="sm" gap="xs">
         <Row gap="xs">
           {agent && <Box width={16} height={16} shrink={false}><Image src={`assets/${agent}-${env.theme.colorScheme}.png`} alt={agentName} size="full" /></Box>}
@@ -219,12 +238,12 @@ function SessionRow({ item }: { item: Item }) {
       <Text size="xs" weight="semibold">Router/Executor 往来消息与工单记录</Text>
       <Text size="xs" muted>Router 收件箱：{item.run.name} · Run {item.runId}</Text>
       <Text size="xs" muted>工单 {item.taskId || '消息'} · 派发 {item.dispatchId || '尚未派发'} · {item.worker?.agentSource || '未取得智能体信息'}</Text>
-      <Text size="xs">{detail?.spec || item.task?.spec || item.run.objective}</Text>
-      {(detail?.result || item.task?.result) && <Text size="xs">结果：{detail?.result || item.task?.result}</Text>}
+      <RecordText text={detail?.spec || item.task?.spec || item.run.objective} />
+      {(detail?.result || item.task?.result) && <RecordText text={`结果：${detail?.result || item.task?.result}`} />}
       {(detail?.messages || item.messages).map(message => <Stack key={message.id} gap="xs">
         <Text size="xs" muted>{message.replied ? '已回复' : !message.unread ? '已读' : message.deliveredAt ? '已送达' : '待送达'}</Text>
         <Text size="xs" weight="medium">{message.subject} · {message.from}</Text>
-        <Text size="xs">{message.body}</Text>
+        <RecordText text={message.body} />
       </Stack>)}
       </Stack>}
       <Row gap="sm" wrap>
@@ -245,6 +264,14 @@ function SessionRow({ item }: { item: Item }) {
   </Stack>
 }
 export default function Panel() {
+  if (visibilityContext) {
+    const ctx = visibilityContext
+    const visible = read(ctx.visible)
+    const becameVisible = visible && !wasVisible
+    wasVisible = visible
+    // Reading subscribes to visibility; defer the refresh beyond the pure render phase.
+    if (becameVisible) void Promise.resolve().then(() => { if (!ctx.signal.aborted && read(ctx.visible)) void refresh(true) })
+  }
   const data = read(snapshot)
   const all = data ? rows(data) : []
   const needle = read(query).trim().toLocaleLowerCase()
@@ -289,7 +316,7 @@ export default function Panel() {
     </Box>
     <Separator />
     {read(error) && <Callout tone="danger">{read(error)}</Callout>}
-    {read(filtersOpen) && data?.warnings.map(warning => <Callout key={warning} tone="warning">{warning}</Callout>)}
+    {data?.warnings.map(warning => <Callout key={warning} tone="warning">{warning}</Callout>)}
     {read(result) && <Box padding="sm" gap="xs"><Text size="xs">{read(result)}</Text>{read(receipt) && <CodeView code={read(receipt)} wrap maxHeight="sm" />}</Box>}
     {!data && <Skeleton />}
     {data && !filtered.length && <Box padding="sm"><Text size="sm" muted>当前范围没有匹配的会话。</Text></Box>}

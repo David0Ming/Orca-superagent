@@ -5,7 +5,7 @@ import { join, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { promisify } from 'node:util'
 import type { OrcaWorkerApi } from 'orca/worker'
-import { ACTIVE_TASK_STATUSES, COMPLETED_STATUSES, isActionableMessage, belongsToTask, waitingCondition } from './protocol'
+import { ACTIVE_TASK_STATUSES, COMPLETED_STATUSES, isActionableMessage, belongsToTask, blockedQuestion, isSystemReceipt } from './protocol'
 import type { Action, ActionResult, Detail, MessageView, RunView, Selection, Snapshot, TaskView, WorkerView } from './protocol'
 
 const exec = promisify(execFile)
@@ -84,6 +84,7 @@ async function readRun(run: any, inbox: any[], call: Cli, environments = names()
     return { id: message.id, from: message.from_handle || '', to: message.to_handle || '', subject: message.subject || '', body: message.body || '',
       type: message.type || '', createdAt: time(message.created_at), unread: !message.read,
       threadId: message.thread_id || '', deliveredAt: time(message.delivered_at), replied, source: payload.source || '',
+      systemReceipt: isSystemReceipt({ id: message.id, subject: message.subject || '', body: message.body || '' }),
       taskId: payload.taskId || '', dispatchId: payload.dispatchId || '' }
   })
   const rawTasks: any[] = tasks.tasks || []
@@ -108,7 +109,7 @@ async function readRun(run: any, inbox: any[], call: Cli, environments = names()
         dispatchId: task.dispatch_id || task.dispatchId || worker?.dispatchId || '', assignee: task.assignee_handle || task.assignee || '' }
       const candidates = [time(task.completed_at), times.get(task.id) || '', ...messages.filter(message => belongsToTask(message, view, worker)).map(message => message.createdAt)].filter(value => Number.isFinite(Date.parse(value)))
       view.updatedAt = time(task.updated_at) || candidates.sort((a, b) => Date.parse(b) - Date.parse(a))[0] || ''
-      if (view.status === 'blocked') view.waitingCondition = waitingCondition(view)
+      if (view.status === 'blocked') view.blockedQuestion = blockedQuestion(view)
       return view
     }), messages,
   }
@@ -122,14 +123,23 @@ export async function collect(limit = 20, call: Cli = cli, context?: { terminals
   const needle = query.trim().toLocaleLowerCase()
   const warnings: string[] = []
   const [page, spaces, current, mail, projects, terminals] = await Promise.all([
-    call(['orchestration', 'run-list', '--limit', String(limit), '--full']),
+    (async () => {
+      const records: any[] = []
+      let cursor = ''
+      for (let offset = 0; offset < limit; offset += 100) {
+        const page = await call(['orchestration', 'run-list', '--limit', String(Math.min(100, limit - offset)), '--full', ...(cursor ? ['--cursor', cursor] : [])])
+        records.push(...(page.runs || []))
+        cursor = page.nextCursor || ''
+        if (!cursor) break
+      }
+      return { runs: records, nextCursor: cursor }
+    })(),
     call(['worktree', 'list', '--limit', '10000']),
     context === undefined ? call(['worktree', 'show', '--worktree', 'active']).catch(() => ({})) : Promise.resolve({}),
     call(['orchestration', 'inbox', '--limit', '1000', '--full']).catch(e => { warnings.push(`消息读取失败：${e.message}`); return { messages: [] } }),
     call(['project', 'list']),
     call(['terminal', 'list', '--limit', '10000']),
   ])
-  if (mail.messages?.length >= 1000) warnings.push('消息仅包含最近 1000 条；更早会话仍可展开读取执行记录。')
   const runs: RunView[] = []
   const environments = names()
   // Five CLI collections at a time keeps the desktop responsive while browsing older Runs.
@@ -160,7 +170,6 @@ export async function collect(limit = 20, call: Cli = cli, context?: { terminals
   const focusedTerminal = terminals.terminals?.find((terminal: any) => context?.terminals.some(t => t.id === terminal.ptyId || t.id === terminal.id || t.id === terminal.handle))
   const focused = workspaces.find((w: any) => w.id === focusedTerminal?.worktreeId)
   const data: Snapshot = { runs, workspaces, currentWorkspace: focused?.id || current.worktree?.id || '', currentProject: focused?.project || current.worktree?.projectId || current.worktree?.repoId || '',
-    routers: (terminals.terminals || []).filter((t: any) => t.agentIdentity && t.connected && t.writable).map((t: any) => ({ handle: t.handle, title: t.title || t.handle, agent: t.agentIdentity })),
     more: !!page.nextCursor, warnings: [...warnings, ...(spaces.warnings || [])] }
   listCache = { key, call, at: Date.now(), data }
   return data
@@ -223,23 +232,22 @@ export async function detail(input: Selection & { cursor?: string; history?: boo
     warnings: [...(result.warnings || []), ...(partial && transcript ? ['尾部窗口未找到用户输入，仅展示最近回复；本轮不完整。'] : []), ...(clipped ? ['输出超过显示预算，已截断；可读取历史记录。'] : [])] }
 
 }
-export async function action(input: Action, call: Cli = cli): Promise<ActionResult> {
+async function copyReference(text: string) {
+  // Orca's clipboard CLI targets browser tabs; pbcopy needs a UTF-8 locale for Chinese text.
+  const copy = exec('/usr/bin/pbcopy', [], { timeout: 5000, env: { ...process.env, LC_ALL: 'en_US.UTF-8' } })
+  copy.child.stdin!.end(text)
+  await copy
+}
+export async function action(input: Action, call: Cli = cli, copy = copyReference): Promise<ActionResult> {
   if (!input || !['open', 'reassess', 'mention'].includes(input.kind)) throw new Error('不支持的操作')
   const { run, task, worker, coordinatorHandle } = await resolve(input, call)
   const handle = worker?.terminal || task?.assignee || run.handle
   if (input.kind === 'mention') {
-    const router = input.router || run.handle
-    if (!router || !/^term_[\w-]+$/.test(router)) throw new Error('没有可写的 Router 终端，请先选择 Router 窗口')
-    const target = (await call(['terminal', 'show', '--terminal', router])).terminal
-    if (!target?.connected || !target.writable || !target.agentIdentity) throw new Error('Router 窗口当前不是可写的智能体输入框')
     const location = handle && !worker?.workspace ? (await call(['terminal', 'show', '--terminal', handle]).catch(() => ({}))).terminal?.worktreeId : worker?.workspace
     const reference = `@任务「${task?.title || run.name}」 run=${run.runId}${task ? ` task=${task.id}` : ''}${worker ? ` dispatch=${worker.dispatchId}` : ''}${handle ? ` window=${handle}` : ''}${location ? ` workspace=${location}` : ''} `
       .replace(/[\x00-\x1f\x7f]/g, ' ')
-    // A single line, no Enter: append a reference to the owner's existing draft, never submit it.
-    const receipt = await call(['terminal', 'send', '--terminal', router, '--text', reference])
-    if (receipt.accepted === false) throw new Error('Orca 未接受定位文本，未自动重试')
-    await call(['terminal', 'switch', '--terminal', router])
-    return { ok: true, message: '任务与窗口定位已填入 Router 输入框，未发送。' }
+    await copy(reference)
+    return { ok: true, message: `已复制${task ? `任务 ${task.id}` : `Run ${run.runId}`} 的引用，可粘贴给 Router 询问；未发送。` }
   }
   if (input.kind === 'open') {
     if (handle) {

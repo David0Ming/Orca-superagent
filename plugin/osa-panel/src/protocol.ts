@@ -1,14 +1,14 @@
 export const ACTIVE_TASK_STATUSES = new Set(['pending', 'ready', 'dispatched'])
 export const COMPLETED_STATUSES = new Set(['completed', 'succeeded', 'success', 'done'])
-export type Section = 'attention' | 'queued' | 'active' | 'history'
+export type Section = 'attention' | 'ready' | 'waiting' | 'active' | 'history'
 export interface MessageView {
   id: string; from: string; to: string; subject: string; body: string; type: string
   createdAt: string; unread: boolean; taskId: string; dispatchId: string
-  threadId?: string; deliveredAt?: string; replied?: boolean; source?: string
+  threadId?: string; deliveredAt?: string; replied?: boolean; source?: string; systemReceipt?: boolean
 }
-export function isSystemReceipt(message: Pick<MessageView, 'id' | 'subject' | 'body'>) {
-  return message.id.toLowerCase().startsWith('msg_stop_')
-    || /did\s+not\s+reach|reach\s+the\s+finished\s+worker|worker\s+stopped\s+without\s+reporting|waiting\s+on\s+a\s+prompt/i.test(`${message.subject} ${message.body}`)
+export function isSystemReceipt(message: Pick<MessageView, 'id' | 'subject' | 'body' | 'systemReceipt'>) {
+  return message.systemReceipt ?? (message.id.toLowerCase().startsWith('msg_stop_')
+    || /did\s+not\s+reach|reach\s+the\s+finished\s+worker|worker\s+stopped\s+without\s+reporting|waiting\s+on\s+a\s+prompt/i.test(`${message.subject} ${message.body}`))
 }
 // Status has no reliable human-author marker in the native inbox response.
 export function isActionableMessage(message: Pick<MessageView, 'id' | 'subject' | 'body' | 'type' | 'unread' | 'to' | 'from' | 'replied' | 'source'>, run: Pick<RunView, 'runId' | 'handle'>) {
@@ -28,20 +28,14 @@ export interface WorkerView {
 }
 export interface TaskView {
   id: string; title: string; status: string; spec: string; result: string; resultTitle?: string; resultSource?: string; dependencies?: string[]
-  updatedAt: string; dispatchId: string; assignee: string; searchMatch?: string; waitingCondition?: string
+  updatedAt: string; dispatchId: string; assignee: string; searchMatch?: string; blockedQuestion?: string
 }
-export function waitingCondition(task: Pick<TaskView, 'resultTitle' | 'result' | 'spec' | 'dependencies'>) {
-  if (task.dependencies?.length) return `等待：${task.dependencies.join('、')}`
-  for (const text of [task.resultTitle, task.result, task.spec]) {
-    for (const clause of (text || '').split(/[。；;\n]/)) {
-      if (/(?:不|无需|无须|不用|不要)\s*(?:等待|等|待|依赖)/.test(clause) || /^\s*(?:若|如果|假如|如需|当.+?时)/.test(clause)) continue
-      const match = clause.match(/((?:等待|依赖)[^。；;\n]{1,80})/)
-        || clause.match(/(?:^|[：:，,])\s*((?:等|待)[^。；;\n]{1,80})/)
-        || clause.match(/【前置[^】]*】\s*(.+)/)
-      if (match) return match[1].trim()
-    }
-  }
-  return '等待条件未注明'
+// blocked means a person must act, so the result carries one exact question; deps stay machine-checkable.
+export function blockedQuestion(task: Pick<TaskView, 'result' | 'dependencies'>) {
+  const result = task.result.trim()
+  const note = task.dependencies?.length ? `依赖：${task.dependencies.join('、')}` : ''
+  const question = result.startsWith('问题：') ? result : `受阻但未写明要你决定什么${result ? `；记录：${result.slice(0, 120)}` : ''}`
+  return [note, question].filter(Boolean).join('；')
 }
 export interface RunView {
   name: string; runId: string; objective: string; project: string; handle: string
@@ -56,7 +50,6 @@ export function isLiveRun(run: RunView) {
 export interface WorkspaceView { id: string; name: string; path: string; project: string; projectName: string }
 export interface Snapshot {
   runs: RunView[]; workspaces: WorkspaceView[]; currentWorkspace: string; currentProject: string
-  routers?: { handle: string; title: string; agent: string }[]
   more: boolean; warnings: string[]
 }
 export interface Selection { runId: string; taskId?: string; dispatchId?: string }
@@ -65,7 +58,7 @@ export interface Detail {
   history?: boolean; spec: string; result: string; messages: MessageView[]
 }
 export interface Action extends Selection {
-  kind: 'open' | 'reassess' | 'mention'; router?: string
+  kind: 'open' | 'reassess' | 'mention'
 }
 export interface ActionResult { ok: boolean; message: string; receipt?: string }
 declare module 'orca' {

@@ -1,4 +1,5 @@
 node_modules/
 .osa/
+.codegraph/
 *.tsbuildinfo
 .DS_Store

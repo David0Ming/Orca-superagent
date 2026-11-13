@@ -21,7 +21,6 @@ function fixture(coordinator = '') {
       case 'terminal list': return { terminals: [{ ...terminal, worktreeId: 'repo::/one' }] }
       case 'terminal show': return { terminal }
       case 'terminal switch': return { ok: true }
-      case 'terminal send': return { accepted: true, requestId: 'request_one' }
       case 'orchestration send': return { message: { id: 'msg_reassess' } }
       default: throw new Error(`Forbidden/unexpected: ${args.join(' ')}`)
     }
@@ -60,16 +59,20 @@ test('only supported owner actions; direct reply and old continuation reject bef
   assert.equal(calls.some(c => /stop|delete|abandon|release|task-update|run-use/.test(c[1])), false)
 })
 
-test('mention appends task and window references without submitting, and requires a Router', async () => {
-  const { call, calls } = fixture()
-  await assert.rejects(action({ ...target, kind: 'mention' }, call), /Router/)
-  assert.equal(calls.some(c => c[1] === 'send'), false)
-  await action({ ...target, kind: 'mention', router: 'term_router' }, call)
-  const send = calls.find(c => c[1] === 'send')!
-  assert.ok(send)
-  assert.equal(send.includes('--enter'), false)
-  assert.match(send[send.indexOf('--text') + 1], /task=task_one.*window=term_one.*workspace=repo::\/one/)
-  assert.equal(/[\r\n]/.test(send[send.indexOf('--text') + 1]), false)
+test('mention copies task and executor IDs without a Router binding or any message delivery', async () => {
+  for (const coordinator of ['', 'term_router', 'orca_session_id:claude_router']) {
+    const { call, calls } = fixture(coordinator)
+    const copies: string[] = []
+    const response = await action({ ...target, kind: 'mention' }, call, async text => { copies.push(text) })
+    assert.equal(copies.length, 1)
+    const reference = copies[0]
+    assert.match(reference, /run=run_one.*task=task_one.*dispatch=ctx_one.*window=term_one.*workspace=repo::\/one/)
+    assert.equal(/[\r\n]/.test(reference), false)
+    assert.match(response.message, /已复制任务 task_one/)
+    assert.equal(calls.some(c => ['send', 'switch', 'activate', 'run-use', 'task-update'].includes(c[1])), false)
+  }
+  const { call } = fixture()
+  await assert.rejects(action({ ...target, kind: 'mention' }, call, async () => { throw new Error('剪贴板不可用') }), /剪贴板不可用/)
 })
 
 test('reopening the same list reuses the recent snapshot without repeating CLI collection', async () => {
@@ -278,8 +281,32 @@ test('native Router and dispatch aliases verify a reply without accepting anothe
 
 test('blocked waiting evidence is captured before the list truncates task text', async () => {
   const { call } = fixture()
-  const data = await collect(20, async args => args[1] === 'task-list' ? { tasks: [{ id: 'task_one', status: 'blocked', dispatch_id: 'ctx_one', spec: '背景资料'.repeat(100) + '\n等待生产窗口。' }] } : call(args))
+  const data = await collect(20, async args => args[1] === 'task-list' ? { tasks: [{ id: 'task_one', status: 'blocked', dispatch_id: 'ctx_one', spec: '背景资料'.repeat(100), result: '问题：' + '窗口是否可用'.repeat(90) + '？' }] } : call(args))
   assert.equal(data.runs[0].tasks[0].spec.length, 300)
-  assert.equal(data.runs[0].tasks[0].waitingCondition, '等待生产窗口')
+  assert.match(data.runs[0].tasks[0].blockedQuestion || '', /^问题：.+？$/)
   assert.equal(data.runs[0].activeTaskCount, 0)
+})
+
+
+test('120 Runs use native pages no larger than 100 and retain the next cursor', async () => {
+  const { call } = fixture()
+  const pages: number[] = []
+  const data = await collect(120, async args => {
+    if (args[1] !== 'run-list') return call(args)
+    const size = Number(args[args.indexOf('--limit') + 1]); pages.push(size)
+    assert.ok(size <= 100)
+    const start = args.includes('--cursor') ? Number(args[args.indexOf('--cursor') + 1]) : 0
+    return { runs: Array.from({ length: size }, (_, index) => ({ id: `run_${start + index}`, objective: '历史' })), nextCursor: String(start + size) }
+  })
+  assert.deepEqual(pages, [100, 20])
+  assert.equal(data.runs.length, 120)
+  assert.equal(data.more, true)
+})
+
+test('system receipt evidence beyond the 300-character list excerpt remains classified', async () => {
+  const { call } = fixture()
+  const data = await collect(20, async args => args[1] === 'inbox' ? { messages: [{ id: 'receipt_long', run_id: 'run_one', from_handle: 'term_one', to_handle: 'run:run_one', type: 'question', body: '原文'.repeat(160) + ' did not reach the worker' }] } : call(args))
+  assert.equal(data.runs[0].messages[0].body.length, 300)
+  assert.equal(data.runs[0].messages[0].systemReceipt, true)
+  assert.equal(data.runs[0].actionableMessageCount, 0)
 })

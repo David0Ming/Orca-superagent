@@ -1,4 +1,4 @@
-import { assert, mockHost, mount, test } from 'orca/testing'
+import { assert, mockHost, mount, stored, test } from 'orca/testing'
 import * as main from './panel'
 import { isActionableMessage } from './protocol'
 import type { Snapshot, RunView, TaskView } from './protocol'
@@ -11,14 +11,24 @@ const run: RunView = { runId: 'run_one', name: 'Run One', objective: '目标', p
 }
 const data: Snapshot = { runs: [run, { ...run, runId: 'run_two', name: 'Run Two', tasks: [task('dispatched')], workers: [{ ...run.workers[3], workspace: 'ws_two', agent: 'claude' }], messages: [] }],
   workspaces: [{ id: 'ws_one', name: 'One', path: '/one', project: 'project_one', projectName: 'One' }, { id: 'ws_two', name: 'Two', path: '/two', project: 'project_two', projectName: 'Two' }],
-  routers: [{ handle: 'term_router', title: 'Router', agent: 'codex' }], currentWorkspace: 'ws_one', currentProject: 'project_one', more: false, warnings: [],
+  currentWorkspace: 'ws_one', currentProject: 'project_one', more: false, warnings: [],
 }
 
 test('exact task enum wins over live workers; completed stays hidden', () => {
   const rows = main.rows(data)
   assert.deepEqual(rows.filter(row => row.runId === 'run_one').map(row => [row.taskId || 'message', row.section]), [
-    ['pending', 'queued'], ['ready', 'queued'], ['blocked', 'queued'], ['dispatched', 'active'], ['failed', 'attention'], ['message', 'attention'],
+    ['pending', 'waiting'], ['ready', 'ready'], ['blocked', 'attention'], ['dispatched', 'active'], ['failed', 'attention'], ['message', 'attention'],
   ])
+})
+
+test('tickets of a Run with no bound Router and no live worker stay in history', () => {
+  const dormant: RunView = { ...run, canReassess: false, workers: [], messages: [], tasks: ['blocked', 'pending', 'ready', 'dispatched'].map(task) }
+  assert.deepEqual(main.rows({ ...data, runs: [dormant] }).map(row => [row.taskId, row.section, row.summary]), [
+    ['blocked', 'history', '任务状态：blocked'], ['pending', 'history', '任务状态：pending'],
+    ['ready', 'history', '任务状态：ready'], ['dispatched', 'history', '任务状态：dispatched'],
+  ])
+  const live = main.rows({ ...data, runs: [{ ...dormant, tasks: [task('blocked')], workers: [{ ...run.workers[2], taskId: 'blocked', dispatchId: 'ctx_blocked' }] }] })
+  assert.deepEqual(live.map(row => [row.taskId, row.section]), [['blocked', 'attention']])
 })
 
 test('scope, search, filters, grouping, folding and read-only title details', async () => {
@@ -32,7 +42,7 @@ test('scope, search, filters, grouping, folding and read-only title details', as
     assert.deepEqual(panel.errors, [])
     assert.deepEqual(panel.warnings, [])
     assert.ok(panel.find({ type: 'Text', text: '任务清单' }))
-    assert.ok(panel.find({ type: 'Text', text: '待开始·等条件' }))
+    assert.ok(panel.find({ type: 'Text', text: '待开始' }))
     assert.equal(panel.find({ type: 'Text', text: '待开始·阻塞' }), null)
     assert.equal(panel.findAll({ type: 'ListItem', label: 'dispatched task' }).length, 2)
     assert.ok(panel.findAll({ type: 'ListItem', label: 'dispatched task' }).every(row => !row.props.icon))
@@ -40,7 +50,8 @@ test('scope, search, filters, grouping, folding and read-only title details', as
     assert.match(JSON.stringify(panel.tree()), /"background":"warning","border":"warning"/)
     assert.match(JSON.stringify(panel.tree()), /"background":"success","border":"success"/)
     assert.match(JSON.stringify(panel.tree()), /"background":"danger","border":"danger"/)
-    assert.match(JSON.stringify(panel.tree()), /"background":"none","border":false/)
+    assert.match(JSON.stringify(panel.tree()), /"background":"accent","border":"accent"/)
+    assert.match(JSON.stringify(panel.tree()), /"background":"neutral","border":"neutral"/)
     await panel.press({ type: 'Button', text: '工作区' })
     assert.equal(panel.findAll({ type: 'ListItem', label: 'dispatched task' }).length, 1)
     await panel.press({ type: 'Button', text: '项目' })
@@ -54,14 +65,14 @@ test('scope, search, filters, grouping, folding and read-only title details', as
     await panel.select({ label: '智能体' }, 'claude')
     assert.equal(panel.findAll({ type: 'ListItem', label: 'dispatched task' }).length, 1)
     await panel.select({ label: '智能体' }, 'all')
-    await panel.select({ label: '状态' }, 'queued')
+    await panel.select({ label: '状态' }, 'ready')
     assert.equal(panel.find({ type: 'ListItem', label: 'failed task' }), null)
     await panel.select({ label: '分组' }, 'run')
-    await panel.press({ testId: 'queued:run:run_one' })
+    await panel.press({ testId: 'ready:run:run_one' })
     assert.equal(panel.find({ type: 'ListItem', label: 'ready task' }), null)
     await panel.press({ label: '刷新' })
     assert.equal(panel.find({ type: 'ListItem', label: 'ready task' }), null)
-    await panel.press({ testId: 'queued:run:run_one' })
+    await panel.press({ testId: 'ready:run:run_one' })
     await panel.select({ label: '状态' }, 'all')
     await panel.select({ label: '分组' }, 'workspace')
     assert.ok(panel.find({ type: 'List', label: 'One · 分组' }))
@@ -97,7 +108,7 @@ test('one latest unread question row per Run; queued and completed win over live
   assert.equal(messages[0].title, '有消息待回')
   assert.equal(messages[0].summary, '未读待回复 · 最新问题')
   assert.equal(messages[0].updatedAt, '2026-11-11T02:00:00Z')
-  assert.deepEqual(rows.filter(r => r.taskId === 'blocked').map(r => r.section), ['queued'])
+  assert.deepEqual(rows.filter(r => r.taskId === 'blocked').map(r => r.section), ['attention'])
   assert.equal(rows.some(r => ['completed', 'succeeded', 'success', 'done'].includes(r.taskId || '')), false)
   assert.equal(rows.find(r => r.taskId === 'other')?.section, 'active')
 })
@@ -111,7 +122,7 @@ test('history uses raw counts and stays collapsed; empty sections have no headin
     assert.ok(panel.find({ type: 'Button', text: '历史' }))
     assert.equal(panel.find({ type: 'ListItem', label: '历史工作' }), null)
     assert.equal(panel.find({ type: 'Text', text: '需要你' }), null)
-    assert.equal(panel.find({ type: 'Text', text: '待开始·等条件' }), null)
+    assert.equal(panel.find({ type: 'Text', text: '待开始' }), null)
     assert.equal(panel.find({ type: 'Text', text: '进行中' }), null)
     await panel.press({ type: 'Button', text: '历史' })
     assert.ok(panel.find({ type: 'ListItem', label: '历史工作' }))
@@ -121,18 +132,18 @@ test('history uses raw counts and stays collapsed; empty sections have no headin
   } finally { await panel.unmount() }
 })
 
-test('waiting tasks always queue; failed tickets need attention only in a live Run', () => {
+test('blocked needs a person; pending waits for an event; failed needs a live Run', () => {
   const base: RunView = { ...run, workers: [], messages: [] }
   for (const status of ['failed', 'blocked']) {
     const dead = main.rows({ ...data, runs: [{ ...base, tasks: [task(status)] }] })
-    assert.deepEqual(dead.map(r => r.section), [status === 'blocked' ? 'queued' : 'history'])
+    assert.deepEqual(dead.map(r => r.section), [status === 'blocked' ? 'attention' : 'history'])
     assert.equal(dead[0].taskId, status)
     const pending = main.rows({ ...data, runs: [{ ...base, tasks: [task(status), task('pending')] }] })
-    assert.deepEqual(pending.map(r => r.section), [status === 'blocked' ? 'queued' : 'attention', 'queued'])
+    assert.deepEqual(pending.map(r => r.section), [status === 'blocked' ? 'attention' : 'attention', 'waiting'])
     const unread = main.rows({ ...data, runs: [{ ...base, tasks: [task(status)], messages: run.messages }] })
-    assert.deepEqual(unread.map(r => r.section), [status === 'blocked' ? 'queued' : 'history', 'history'])
+    assert.deepEqual(unread.map(r => r.section), [status === 'blocked' ? 'attention' : 'history', 'history'])
     const live = main.rows({ ...data, runs: [{ ...base, tasks: [task(status)], workers: [run.workers[0]] }] })
-    assert.deepEqual(live.map(r => r.section), [status === 'blocked' ? 'queued' : 'attention'])
+    assert.deepEqual(live.map(r => r.section), ['attention'])
   }
 })
 
@@ -145,7 +156,7 @@ test('remount draws persisted rows before a slow list refresh completes', async 
     if (!firstTree) { firstTree = JSON.stringify(tree); firstPaintMs = performance.now() - start }
     return tree
   } }
-  const panel = await mount(wrapped, { persisted: { workspace: { 'last-snapshot': data } }, host: mockHost({ requests: {
+  const panel = await mount(wrapped, { persisted: { workspace: { 'last-snapshot': stored(data, 3) } }, host: mockHost({ requests: {
     'osa-tasks.list': () => new Promise<Snapshot>(resolve => setTimeout(() => resolve(data), 200)),
   } }) })
   try {
@@ -156,24 +167,24 @@ test('remount draws persisted rows before a slow list refresh completes', async 
   } finally { await panel.unmount() }
 })
 
-test('dead blocked tickets queue while failed tickets stay historical', () => {
+test('dead blocked tickets still need a person while failed tickets stay historical', () => {
   const base: RunView = { ...run, workers: [], messages: [], tasks: [task('blocked'), task('failed'), task('other')] }
   const dead = main.rows({ ...data, runs: [base] })
-  assert.deepEqual(dead.map(row => [row.taskId, row.section]), [['blocked', 'queued'], ['failed', 'history'], ['other', 'history']])
+  assert.deepEqual(dead.map(row => [row.taskId, row.section]), [['blocked', 'attention'], ['failed', 'history'], ['other', 'history']])
   const live = main.rows({ ...data, runs: [{ ...base, workers: [{ ...run.workers[0], taskId: 'other', dispatchId: 'ctx_other' }] }] })
-  assert.deepEqual(live.map(row => [row.taskId, row.section]), [['blocked', 'queued'], ['failed', 'attention'], ['other', 'active']])
+  assert.deepEqual(live.map(row => [row.taskId, row.section]), [['blocked', 'attention'], ['failed', 'attention'], ['other', 'active']])
   const unrelatedLive = main.rows({ ...data, runs: [{ ...base, tasks: [task('pending'), task('other')] }] })
-  assert.deepEqual(unrelatedLive.map(row => [row.taskId, row.section]), [['pending', 'queued'], ['other', 'history']])
+  assert.deepEqual(unrelatedLive.map(row => [row.taskId, row.section]), [['pending', 'waiting'], ['other', 'history']])
 })
 
-test('system receipts never create attention or keep failed Runs live; blocked remains queued', () => {
+test('system receipts never create attention or keep failed Runs live; blocked stays in attention', () => {
   const receipts = ['DiD nOt ReAcH', 'REACH THE FINISHED WORKER', 'Worker STOPPED without REPORTING', 'waiting ON a PROMPT']
   for (const type of ['question', 'escalation']) {
     for (const phrase of receipts) for (const field of ['subject', 'body']) {
       const message = { ...run.messages[0], type, subject: '需要决定', body: '真实内容', [field]: phrase }
       assert.equal(isActionableMessage(message, run), false)
       const rows = main.rows({ ...data, runs: [{ ...run, tasks: [task('failed'), task('blocked')], workers: [], messages: [message] }] })
-      assert.deepEqual(rows.map(row => [row.taskId, row.section]), [['failed', 'history'], ['blocked', 'queued']])
+      assert.deepEqual(rows.map(row => [row.taskId, row.section]), [['failed', 'history'], ['blocked', 'attention']])
     }
     assert.equal(isActionableMessage({ ...run.messages[0], type, id: 'msg_stop_test' }, run), false)
     assert.equal(isActionableMessage({ ...run.messages[0], type }, run), true)
@@ -203,18 +214,21 @@ test('bound Router reassess is a single mailbox action without an input composer
 })
 
 
-test('@ delays mention, double click only locates, and unmount cancels a pending mention', async () => {
-  const actions: { kind: string; router?: string }[] = []
+test('@ copies a reference without a Router picker; double click only locates; unmount cancels copying', async () => {
+  const actions: { kind: string }[] = []
   const panel = await mount(main, { host: mockHost({ requests: {
-    'osa-tasks.list': { ...data, runs: [{ ...run, handle: 'term_router', tasks: [task('ready')], messages: [] }] },
-    'osa-tasks.action': input => { actions.push(input); return { ok: true, message: 'ok' } },
+    'osa-tasks.list': { ...data, runs: [{ ...run, handle: '', tasks: [task('ready')], messages: [] }] },
+    'osa-tasks.action': input => { actions.push(input); return { ok: true, message: '已复制任务 ready 的引用，可粘贴给 Router 询问；未发送。' } },
   } }) })
   try {
     await panel.press({ type: 'Button', text: '@' })
     assert.equal(actions.length, 0)
     await new Promise(resolve => setTimeout(resolve, 350))
-    assert.deepEqual(actions.map(action => action.kind), ['mention'])
-    assert.equal(actions[0].router, 'term_router')
+    assert.deepEqual(actions, [{ runId: 'run_one', taskId: 'ready', dispatchId: 'ctx_ready', kind: 'mention' }])
+    await panel.rerender()
+    assert.equal(panel.find({ type: 'Select', label: 'Router 窗口' }), null)
+    assert.equal(panel.find({ type: 'Button', text: '填入 Router 输入框' }), null)
+    assert.ok(panel.find({ type: 'Text', text: '已复制任务 ready 的引用，可粘贴给 Router 询问；未发送。' }))
     await panel.press({ type: 'Button', text: '@' })
     await panel.press({ type: 'Button', text: '@' })
     await new Promise(resolve => setTimeout(resolve, 350))
@@ -286,7 +300,7 @@ test('only workers and pending/ready/dispatched tasks keep Runs live; old read q
   const unread = { ...dead, messages: [{ ...message, unread: true }] }
   assert.deepEqual(main.rows({ ...data, runs: [unread] }).map(row => row.section), ['history', 'history'])
   const blocked = { ...dead, tasks: [task('blocked')] }
-  assert.equal(main.rows({ ...data, runs: [blocked] })[0].section, 'queued')
+  assert.equal(main.rows({ ...data, runs: [blocked] })[0].section, 'attention')
   for (const own of [{ ...message, source: 'osa-panel' }, { ...message, from: 'run:run_one' }, { ...message, type: 'status', subject: 'queue-scan' }]) {
     assert.equal(isActionableMessage(own, live), false)
   }
@@ -309,20 +323,113 @@ test('completed totals include only active Runs, follow actual assignment and ap
 })
 
 
-test('blocked summaries use explicit waiting evidence, never infer conditions from the task goal', () => {
+test('blocked shows the owner question and native dependencies, never a derived condition', () => {
   const summary = (evidence: Partial<TaskView>) => main.rows({ ...data, runs: [{ ...run, tasks: [{ ...task('blocked'), ...evidence }], messages: [] }] })[0].summary
-  assert.equal(summary({ resultTitle: '等生产窗口' }), '等生产窗口')
-  assert.equal(summary({ result: '当前阻塞：等待制品通过验收。其他信息。' }), '等待制品通过验收')
-  assert.equal(summary({ spec: '【前置（唯一长板）】V2 Worker 制品必须构建出来。' }), 'V2 Worker 制品必须构建出来')
-  assert.equal(summary({ dependencies: ['镜像构建'] }), '等待：镜像构建')
-  assert.equal(summary({ spec: '恢复自动回复。不等待审批直接做。若等待制品则暂缓。' }), '等待条件未注明')
-  assert.equal(summary({ spec: '只准备方案，不执行生产切换。' }), '等待条件未注明')
+  assert.equal(summary({ result: '问题：给别的冻结路径还是排同窗双采？' }), '问题：给别的冻结路径还是排同窗双采？')
+  assert.equal(summary({ dependencies: ['镜像构建'], result: '问题：先改哪一处？' }), '依赖：镜像构建；问题：先改哪一处？')
+  assert.equal(summary({ dependencies: ['镜像构建'] }), '依赖：镜像构建；受阻但未写明要你决定什么')
+  assert.equal(summary({ resultTitle: '等生产窗口', spec: '【前置】等待生产窗口' }), '受阻但未写明要你决定什么')
+  assert.equal(summary({ result: '等待：生产窗口；解除：owner确认窗口可用' }), '受阻但未写明要你决定什么；记录：等待：生产窗口；解除：owner确认窗口可用')
 })
 
-
-test('three blocked tickets in a dead Run stay queued without a duplicate historical summary', () => {
+test('three blocked tickets in a dead Run stay in attention without a duplicate historical summary', () => {
   const current = { ...run, workers: [], messages: [], tasks: [1, 2, 3].map(id => ({ ...task('blocked'), id: `blocked_${id}`, title: `Wave2 ${id}` })) }
   const rows = main.rows({ ...data, runs: [current] })
   assert.equal(rows.length, 3)
-  assert.ok(rows.every(row => row.section === 'queued'))
+  assert.ok(rows.every(row => row.section === 'attention'))
+})
+
+
+test('visibility restoration and remount force fresh immediately; ordinary renders do not reload', async () => {
+  const requests: { force?: boolean }[] = []
+  const host = mockHost({ requests: { 'osa-tasks.list': input => { requests.push(input || {}); return data } } })
+  const panel = await mount(main, { visible: false, host, persisted: { workspace: { 'last-snapshot': stored(data, 3) } } })
+  try {
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].force, true)
+    const start = performance.now()
+    await panel.setVisible(true)
+    assert.ok(performance.now() - start < 1000)
+    assert.equal(requests.length, 2)
+    assert.equal(requests[1].force, true)
+    await panel.rerender()
+    await panel.setVisible(true)
+    assert.equal(requests.length, 2)
+    assert.deepEqual(panel.errors, [])
+  } finally { await panel.unmount() }
+  const remount = await mount(main, { host, persisted: { workspace: { 'last-snapshot': stored(data, 3) } } })
+  try {
+    assert.equal(requests.length, 3)
+    assert.equal(requests[2].force, true)
+    assert.deepEqual(remount.errors, [])
+  } finally { await remount.unmount() }
+})
+
+test('visibility changes reuse an already running fresh request', async () => {
+  let requests = 0
+  let finish: ((value: Snapshot) => void) | undefined
+  const panel = await mount(main, { visible: false, host: mockHost({ requests: {
+    'osa-tasks.list': () => { requests += 1; return requests === 1 ? data : new Promise<Snapshot>(resolve => { finish = resolve }) },
+  } }) })
+  try {
+    const first = panel.setVisible(true)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const hidden = panel.setVisible(false)
+    const shown = panel.setVisible(true)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    assert.equal(requests, 2)
+    finish!(data)
+    await Promise.all([first, hidden, shown])
+    assert.equal(requests, 2)
+    assert.deepEqual(panel.errors, [])
+  } finally { finish?.(data); await panel.unmount() }
+})
+
+
+
+test('UTF-8-sized preview cache preserves rows while rejecting oversized persisted values', () => {
+  const large = { ...data, runs: [{ ...run,
+    tasks: Array.from({ length: 150 }, (_, index) => ({ ...task('blocked'), id: `task_${index}`, spec: '背景资料'.repeat(150), result: '问题：owner先确认窗口可用？' })),
+    messages: Array.from({ length: 150 }, (_, index) => ({ ...run.messages[0], id: `message_${index}`, subject: '', body: '中文正文'.repeat(150) + ' Worker stopped without reporting' })),
+  }] }
+  assert.ok(new TextEncoder().encode(JSON.stringify({ version: 3, value: large })).length > 262144)
+  const preview = main.cachePreview(large)!
+  assert.ok(preview)
+  assert.ok(new TextEncoder().encode(JSON.stringify({ version: 3, value: preview })).length <= 262144)
+  assert.deepEqual(main.rows(preview).map(row => [row.key, row.section, row.updatedAt]), main.rows(large).map(row => [row.key, row.section, row.updatedAt]))
+  assert.equal(preview.runs[0].tasks.length, 150)
+  assert.equal(preview.runs[0].messages.length, 150)
+  assert.equal(preview.runs[0].tasks[0].blockedQuestion, '问题：owner先确认窗口可用？')
+  assert.equal(isActionableMessage(preview.runs[0].messages[0], preview.runs[0]), false)
+  assert.equal(main.cachePreview({ ...large, workspaces: [{ ...data.workspaces[0], path: '路径'.repeat(150000) }] }), null)
+})
+
+test('old full cache is invalidated; oversized cache leaves fresh data visible with an explicit warning', async () => {
+  let firstTree = ''
+  const oversized = { ...data, workspaces: [{ ...data.workspaces[0], path: '路径'.repeat(150000) }] }
+  const wrapped = { ...main, default: () => { const tree = main.default(); if (!firstTree) firstTree = JSON.stringify(tree); return tree } }
+  const panel = await mount(wrapped, { persisted: { workspace: { 'last-snapshot': data } }, host: mockHost({ requests: { 'osa-tasks.list': oversized } }) })
+  try {
+    assert.equal(firstTree.includes('dispatched task'), false)
+    assert.ok(panel.find({ type: 'ListItem', label: 'ready task' }))
+    assert.ok(panel.find({ type: 'Callout', text: '列表已更新；快照超过 Orca 256 KiB 缓存上限，本次不保留缓存。' }))
+  } finally { await panel.unmount() }
+})
+
+
+
+test('long original records are bounded and list failures are visible without opening filters', async () => {
+  const warning = '消息读取失败：实际接口不可用'
+  const panel = await mount(main, { host: mockHost({ requests: {
+    'osa-tasks.list': { ...data, warnings: [warning], runs: [{ ...run, tasks: [task('dispatched')] }] },
+    'osa-tasks.detail': { spec: '原始说明'.repeat(5000), result: '结果'.repeat(10000), messages: [{ ...run.messages[0], body: '原始消息'.repeat(5000) }], source: 'transcript', text: '最新回答', cursor: '', limited: false, warnings: [] },
+  } }) })
+  try {
+    assert.ok(panel.find({ type: 'Callout', text: warning }))
+    await panel.press({ type: 'ListItem', label: 'dispatched task' })
+    await panel.press({ type: 'Button', text: '查看往来消息' })
+    assert.equal(panel.findAll({ type: 'Text', text: '内容超过 16000 字，已截断显示；原始记录未改动。' }).length, 3)
+    assert.deepEqual(panel.errors, [])
+    assert.deepEqual(panel.warnings, [])
+  } finally { await panel.unmount() }
 })
